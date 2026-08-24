@@ -1,0 +1,40 @@
+{
+  "geometry": "2048x1061+-7+104",
+  "layout": {
+    "areas": {
+      "left": [
+        "library",
+        "project"
+      ],
+      "center": [
+        "graph"
+      ],
+      "right": [
+        "properties"
+      ],
+      "bottom": [
+        "log"
+      ]
+    },
+    "sashes": {
+      "outer": [
+        816
+      ],
+      "top": [
+        355,
+        1352
+      ],
+      "left": [
+        273
+      ]
+    }
+  },
+  "expanded": [
+    "Check_Inven_Full",
+    "Common",
+    "Example",
+    "ExampleGraph",
+    "MBM_CharSelect"
+  ],
+  "last_macro": "D:\\Programming\\Oculix-Automation\\Macros\\MBM_Run_Dungeon\\macro.json"
+}
