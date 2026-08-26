@@ -84,6 +84,7 @@ try:
     import keypicker
     import model
     import node_canvas
+    import notify
     import pickers
     import project_panel
     import runner
@@ -110,6 +111,9 @@ class ConditionEditor(ttk.Frame):
         self.rebuild()
 
     def rebuild(self):
+        # 조건 종류를 바꾸면 아래 칸들이 통째로 갈린다. build_properties 와
+        # 같은 이유로, 부수기 전에 아직 안 들어간 입력을 먼저 반영한다.
+        self.app.flush_property_edits()
         for child in self.winfo_children():
             child.destroy()
 
@@ -254,6 +258,11 @@ class MacroEditorApp(object):
         self.job = None
         self.log_queue = queue.Queue()
 
+        # 속성 패널에서 아직 반영되지 않았을 수 있는 입력칸들.
+        # (아직 안 넣었나? 함수, 넣는 함수) 짝을 담는다. flush_property_edits 참조.
+        self._prop_commits = []
+        self._flushing_props = False
+
         # 패널은 도킹 매니저가 만들 때 채워진다. 그 전에 참조될 수 있으니 비워 둔다.
         self.dock = None
         self.library_list = None
@@ -274,6 +283,9 @@ class MacroEditorApp(object):
         self._drag_ghost = None
 
         self.config = settings.load()
+        # 실행이 끝났을 때 Windows 알림을 띄울지. 메뉴의 체크 항목과 묶인다.
+        self.notify_var = tk.BooleanVar(
+            value=bool(self.config.get("notify_on_done", True)))
         self._log_buffer = []
         self._saved_expanded = self.config.get("expanded") or []
         self.macro = model.Macro(graph_model.blank(u"새 매크로"))
@@ -325,6 +337,11 @@ class MacroEditorApp(object):
         m_tools.add_command(label=u"좌표계 대조 (OculiX와 비교)",
                             command=self.verify_coordinates)
         m_tools.add_command(label=u"화면 정보", command=self.show_screen_info)
+        m_tools.add_separator()
+        m_tools.add_checkbutton(
+            label=u"실행이 끝나면 Windows 알림",
+            variable=self.notify_var, command=self._on_notify_toggle,
+            state="normal" if notify.available() else "disabled")
         bar.add_cascade(label=u"도구", menu=m_tools)
 
         m_view = tk.Menu(bar, tearoff=0)
@@ -371,7 +388,7 @@ class MacroEditorApp(object):
 
         # 삭제 / 위로 / 아래로 는 버튼으로 쓰지 않는다.
         # 노드는 우클릭이나 Delete 키로, 트리는 우클릭 메뉴로 처리한다.
-        for text, command in ((u"복제", self.duplicate_step),
+        for text, command in ((u"복제 (Ctrl+D)", self.duplicate_step),
                               (u"사용/해제", self.toggle_step)):
             ttk.Button(bar, text=text, command=command).pack(side="left", padx=(6, 0))
 
@@ -381,6 +398,10 @@ class MacroEditorApp(object):
         self.stop_button = ttk.Button(bar, text=u"■ 중지", command=self.stop_macro,
                                       state="disabled")
         self.stop_button.pack(side="left", padx=(6, 0))
+
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
+        ttk.Button(bar, text=u"⌖ 시작 노드로 이동",
+                   command=self.goto_entry_node).pack(side="left")
 
     def _build_body(self):
         """패널을 도킹 매니저에 등록한다. 실제 배치는 저장된 레이아웃을 따른다."""
@@ -492,6 +513,10 @@ class MacroEditorApp(object):
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
         self.tree.bind("<Button-3>", self._on_tree_right_click)
         self.tree.bind("<Delete>", lambda e: self.delete_step())
+        # Ctrl+D 는 캔버스와 트리 각각에 건다. 루트에 걸면 속성칸에 글자를
+        # 치는 중에도 복제가 일어난다.
+        self.tree.bind("<Control-d>", lambda e: (self.duplicate_step(), "break")[1])
+        self.tree.bind("<Control-D>", lambda e: (self.duplicate_step(), "break")[1])
         self.tree.tag_configure("disabled", foreground=theme.FG_FAINT)
         self.tree.tag_configure("container", foreground=theme.ACCENT)
         if self.macro is not None:
@@ -1503,14 +1528,20 @@ class MacroEditorApp(object):
         if graph_model.resolve_macro_ref(ref, base) is None:
             self.log_line(u"주의: 호출 대상을 찾을 수 없습니다: %s" % ref, "err")
 
-    def check_call_targets(self):
-        """호출 노드가 가리키는 매크로의 존재와 순환을 확인한다."""
+    def check_call_targets(self, only=None):
+        """호출 노드가 가리키는 매크로의 존재와 순환을 확인한다.
+
+        `only` 에 노드 id 집합을 주면 그 노드들만 본다. 노드를 붙여넣은
+        직후처럼 방금 들어온 것만 짚어야 할 때 쓴다.
+        """
         problems = []
         if self.mode != "graph" or self.graph is None:
             return problems
         base = self.macro.folder or MACROS_DIR
         for node in self.graph.nodes:
             if node.get("type") != "call":
+                continue
+            if only is not None and node.get("id") not in only:
                 continue
             ref = node.get("macro")
             if not ref:
@@ -1736,7 +1767,7 @@ class MacroEditorApp(object):
         if isinstance(path[-1], int):
             menu.add_command(label=u"위로", command=lambda: self.move_step(-1))
             menu.add_command(label=u"아래로", command=lambda: self.move_step(1))
-            menu.add_command(label=u"복제", command=self.duplicate_step)
+            menu.add_command(label=u"복제 (Ctrl+D)", command=self.duplicate_step)
             menu.add_command(label=u"사용/해제", command=self.toggle_step)
             menu.add_separator()
             menu.add_command(label=u"삭제", command=self.delete_step)
@@ -1817,8 +1848,7 @@ class MacroEditorApp(object):
 
     def duplicate_step(self):
         if self.mode == "graph":
-            if self.canvas_view.selected_node:
-                self.canvas_view._duplicate(self.canvas_view.selected_node)
+            self.canvas_view.duplicate_selection()
             return
         path = self.selected_path()
         if not path or not isinstance(path[-1], int) or self.safe_get(path) is None:
@@ -1848,14 +1878,76 @@ class MacroEditorApp(object):
 
     # ------------------------------------------------------------- 속성 패널
 
+    def _watch_field(self, read, commit):
+        """타이핑으로 고치는 칸 하나를 '아직 안 넣었을 수 있는 것'으로 등록한다.
+
+        반환한 함수를 <FocusOut>/<Return> 에 걸면 된다.
+
+        <FocusOut> 만으로는 부족하다. 캔버스에서 다른 노드를 클릭하면
+        `_on_press` 가 `focus_set()` 을 부르지만 Tk 는 FocusOut 이벤트를
+        이벤트 루프 뒤쪽에서 보낸다. 그 전에 선택이 바뀌면서 속성 패널이
+        통째로 다시 지어져 입력칸이 파괴되고, 이벤트는 끝내 오지 않는다.
+        Enter 를 치지 않고 노드를 클릭하면 방금 친 값이 조용히 사라졌던 이유다.
+        그래서 패널을 지우기(그리고 저장/실행하기) 직전에 여기 등록된 것을
+        먼저 반영한다.
+        """
+        state = {"was": read()}
+
+        def commit_now(_event=None):
+            commit()
+            # 반영이 끝났으면 기준값을 새로 잡는다. 나중에 flush 가 돌 때
+            # 같은 값을 두 번 쓰지 않게 하려는 것이다. 값이 잘못돼서
+            # commit 이 거절했다면 그 글자가 기준이 되고, 다시 시도해도
+            # 같은 이유로 거절되므로 반복 경고가 나지 않는다.
+            try:
+                state["was"] = read()
+            except tk.TclError:
+                pass
+
+        def pending():
+            return read() != state["was"]
+
+        self._prop_commits.append((pending, commit_now))
+        return commit_now
+
+    def flush_property_edits(self):
+        """속성 패널에서 아직 반영되지 않은 입력을 지금 반영한다.
+
+        건드리지 않은 칸은 건너뛴다 - 값이 그대로인데 commit 을 부르면
+        반복 노드의 '횟수/조건' 처럼 서로를 지우는 필드가 엉킬 수 있다.
+        """
+        if self._flushing_props:
+            return
+        # 목록은 비우지 않는다. 아직 살아 있는 칸의 등록까지 버리면 다음
+        # flush 가 그 칸을 놓친다. commit_now 가 기준값을 새로 잡으므로
+        # 같은 값을 두 번 쓰는 일은 없다. 목록은 build_properties 가 비운다.
+        self._flushing_props = True
+        try:
+            for is_pending, commit_now in list(self._prop_commits):
+                try:
+                    if not is_pending():
+                        continue
+                except tk.TclError:
+                    continue      # 위젯이 이미 사라졌다
+                try:
+                    commit_now()
+                except tk.TclError:
+                    pass
+        finally:
+            self._flushing_props = False
+
     def build_properties(self):
         if self.prop_frame is None:
             return
+        # 위젯을 부수기 전에 먼저 반영한다. 순서가 반대면 값이 사라진다.
+        self.flush_property_edits()
         try:
             children = self.prop_frame.winfo_children()
         except tk.TclError:
             self.prop_frame = None
+            self._prop_commits = []
             return
+        self._prop_commits = []
         for child in children:
             child.destroy()
 
@@ -2053,9 +2145,10 @@ class MacroEditorApp(object):
                 combo.set(ref)
                 changed()
                 self._warn_missing_call(ref)
-            combo.bind("<<ComboboxSelected>>", commit_ref)
-            combo.bind("<FocusOut>", commit_ref)
-            combo.bind("<Return>", commit_ref)
+            watched_ref = self._watch_field(lambda: combo.get(), commit_ref)
+            combo.bind("<<ComboboxSelected>>", watched_ref)
+            combo.bind("<FocusOut>", watched_ref)
+            combo.bind("<Return>", watched_ref)
 
             def open_ref():
                 ref = (target.get(name) or "").strip()
@@ -2116,8 +2209,10 @@ class MacroEditorApp(object):
                 else:
                     target.pop(name, None)
                 changed()
-            widget.bind("<FocusOut>", on_text)
-            widget.bind("<KeyRelease>", on_text)
+            watched_text = self._watch_field(
+                lambda: widget.get("1.0", "end-1c"), on_text)
+            widget.bind("<FocusOut>", watched_text)
+            widget.bind("<KeyRelease>", watched_text)
 
         else:
             var = tk.StringVar(value=self._value_to_text(target.get(name)))
@@ -2148,8 +2243,9 @@ class MacroEditorApp(object):
                         u"횟수 반복으로 바꿨습니다 - '조건'을 비웠습니다")
                     self.root.after_idle(self.build_properties)
                 changed()
-            entry.bind("<FocusOut>", commit)
-            entry.bind("<Return>", commit)
+            watched = self._watch_field(lambda: var.get(), commit)
+            entry.bind("<FocusOut>", watched)
+            entry.bind("<Return>", watched)
 
             self._add_field_buttons(row, field, target, var, commit)
 
@@ -2221,8 +2317,9 @@ class MacroEditorApp(object):
                     self.status.set(u"%s" % exc)
                     return
                 changed()
-            entry.bind("<FocusOut>", commit)
-            entry.bind("<Return>", commit)
+            watched = self._watch_field(lambda v=var: v.get(), commit)
+            entry.bind("<FocusOut>", watched)
+            entry.bind("<Return>", watched)
 
         known = set(p.get("name") for p in declared)
         stale = [k for k in sorted(args.keys()) if k not in known]
@@ -2500,6 +2597,9 @@ class MacroEditorApp(object):
     # --------------------------------------------------------------- 파일 조작
 
     def _confirm_discard(self):
+        # 아직 안 들어간 입력이 있으면 dirty 가 아니어서 "저장할까요?" 를
+        # 묻지도 않고 그냥 버려진다. 묻기 전에 먼저 반영한다.
+        self.flush_property_edits()
         if not self.macro.dirty:
             return True
         answer = messagebox.askyesnocancel(
@@ -2554,6 +2654,8 @@ class MacroEditorApp(object):
                           % (len(missing), ", ".join(n for _p, n in missing)), "err")
 
     def save_macro(self):
+        # 속성칸에 Enter 를 치지 않은 채 Ctrl+S 를 눌러도 방금 친 값이 들어가야 한다.
+        self.flush_property_edits()
         if not self.macro.path:
             return self.save_macro_as()
         try:
@@ -2616,6 +2718,11 @@ class MacroEditorApp(object):
         self.refresh_library()
         self.refresh_submacros()
         self.refresh_project()
+        # 이제 이미지 폴더가 생겼다. 캔버스가 아직 예전 기준(대개 None)을
+        # 들고 있으면 썸네일도, 붙여넣을 때 가져오는 이미지도 갈 곳을 잃는다.
+        if self.mode == "graph" and self.canvas_view is not None:
+            self.canvas_view.base_dir = self.resource_dir()
+            self.canvas_view.redraw()
         self.log_line(u"이미지는 이 폴더에 놓입니다: %s" % self.resource_dir(),
                       "info")
         return True
@@ -2825,6 +2932,7 @@ class MacroEditorApp(object):
         ttk.Button(bar, text=u"취소", command=dialog.destroy).pack(side="right")
 
     def validate_macro(self):
+        self.flush_property_edits()
         warnings = []
         if self.mode == "graph" and self.graph is not None:
             problems, warnings = self.graph.validate()
@@ -2888,6 +2996,24 @@ class MacroEditorApp(object):
                 u"편집기가 찍은 좌표를 OculiX가 다르게 해석하는 것입니다." % diff, "err")
             self.status.set(u"좌표계 불일치")
 
+    # ----------------------------------------------------------------- 보기
+
+    def goto_entry_node(self):
+        """시작 노드가 화면 밖에 있어도 찾아갈 수 있게 화면을 그쪽으로 옮긴다.
+
+        다른 매크로를 열면 노드가 저장된 좌표에 그려지므로, 지금 보고 있던
+        자리와 멀면 캔버스가 텅 빈 것처럼 보인다. 그때 쓰는 버튼이다.
+        배율과 선택은 그대로 두고 보는 위치만 옮긴다.
+        """
+        if self.mode != "graph" or getattr(self, "canvas_view", None) is None:
+            self.status.set(u"노드 모드에서만 됩니다")
+            return
+        if not self.canvas_view.focus_entry():
+            self.status.set(u"시작 노드가 없습니다")
+            return
+        self.canvas_view.canvas.focus_set()
+        self.status.set(u"시작 노드로 이동했습니다")
+
     # --------------------------------------------------------------- 실행
 
     def run_from_selected_node(self):
@@ -2909,6 +3035,9 @@ class MacroEditorApp(object):
     def run_macro(self, start_node=None):
         if self.job and self.job.is_running():
             return
+        # dirty 판정보다 먼저다. 아직 안 들어간 값이 있으면 dirty 가 아니어서
+        # 저장을 건너뛰고 옛 파일이 실행된다.
+        self.flush_property_edits()
         if not self.macro.path:
             messagebox.showinfo(u"먼저 저장", u"실행하려면 매크로를 저장해야 합니다.")
             if not self.save_macro():
@@ -2962,6 +3091,7 @@ class MacroEditorApp(object):
     def _on_run_done(self, code):
         self.run_button.config(state="normal")
         self.stop_button.config(state="disabled")
+        cancelled = bool(self.job and self.job.cancelled)
         if code == 0:
             self.log_line(u"===== 정상 종료 (exit 0) =====", "ok")
             self.status.set(u"정상 종료")
@@ -2971,6 +3101,34 @@ class MacroEditorApp(object):
         else:
             self.log_line(u"===== 종료 코드 %s =====" % code, "err")
             self.status.set(u"오류 (exit %s)" % code)
+        self._notify_run_done(code, cancelled)
+
+    def _on_notify_toggle(self):
+        """알림 켜기/끄기. 레이아웃 설정에 함께 저장한다."""
+        self.config["notify_on_done"] = bool(self.notify_var.get())
+        settings.save(self.config)
+
+    def _notify_run_done(self, code, cancelled):
+        """매크로가 끝났다고 Windows 알림으로 알린다.
+
+        긴 매크로는 사용자가 다른 창을 보는 동안 돈다. 상태줄과 로그만으로는
+        끝난 줄 모른다. 알림이 실패해도 실행 결과 처리에는 영향을 주지 않는다.
+        """
+        if not self.notify_var.get():
+            return
+        name = (self.macro.data.get("name")
+                or os.path.basename(self.macro.folder or u"")
+                or u"매크로")
+        if cancelled:
+            result = u"중지했습니다"
+        elif code == 0:
+            result = u"정상 종료"
+        elif code == 1:
+            result = u"단계 실패로 중단"
+        else:
+            result = u"오류 (종료 코드 %s)" % code
+        notify.notify(u"OculiX 매크로 — %s" % name, result,
+                      on_error=lambda text: self.log_line(text, "err"))
 
     def log_line(self, text, tag=None):
         # 패널이 다시 지어질 때 내용을 잃지 않도록 버퍼에도 남긴다

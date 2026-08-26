@@ -16,6 +16,7 @@ DEFAULTS = {
     "layout": None,          # docking.DockManager.get_layout() 결과
     "expanded": [],          # 프로젝트 트리에서 펼쳐 둔 폴더 경로
     "last_macro": None,
+    "notify_on_done": True,  # 실행이 끝나면 Windows 알림
 }
 
 

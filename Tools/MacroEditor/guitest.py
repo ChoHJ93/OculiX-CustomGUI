@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import macro_editor
 import model
 import node_canvas
+import notify
 import schema
 
 PROJECT_ROOT = os.path.normpath(os.path.join(
@@ -44,6 +45,42 @@ def check(name, condition, detail=""):
 def section(title):
     print("")
     print("=== %s ===" % title)
+
+
+def _find_widgets(widget, kinds):
+    """위젯 트리에서 주어진 클래스의 위젯을 만들어진 순서대로 모은다."""
+    out = []
+    for w in widget.winfo_children():
+        if isinstance(w, kinds):
+            out.append(w)
+        out.extend(_find_widgets(w, kinds))
+    return out
+
+
+def _field_widget(widget, label, kinds):
+    """속성 패널에서 이 라벨이 붙은 입력 위젯을 찾는다. 없으면 None.
+
+    한 줄(Frame)이 [라벨][입력칸] 으로 이루어진다는 build_field 의 구조를
+    그대로 이용한다. 순서 인덱스로 집으면 스키마에 필드가 하나 늘 때마다
+    엉뚱한 칸을 집게 된다.
+    """
+    for frame in _find_widgets(widget, (ttk_module.Frame, ttk_module.LabelFrame)):
+        names = [w for w in frame.winfo_children()
+                 if isinstance(w, ttk_module.Label)]
+        if not any(w.cget("text") == label for w in names):
+            continue
+        found = [w for w in frame.winfo_children() if isinstance(w, kinds)]
+        if found:
+            return found[0]
+    return None
+
+
+def _field_entry(widget, label):
+    return _field_widget(widget, label, ttk_module.Entry)
+
+
+def _field_text(widget, label):
+    return _field_widget(widget, label, tk.Text)
 
 
 def _all_labels(widget):
@@ -1990,6 +2027,371 @@ _ce, _cw = _cg.validate()
 check(u"검사가 횟수+조건 충돌을 잡는다",
       any(u"함께 쓸 수 없" in e for e in _ce), u"%r" % (_ce,))
 
+section(u"노드 복사 / 붙여넣기")
+
+# 진짜 클립보드를 쓴다. 사용자의 클립보드를 되돌려 주려고 먼저 챙겨 둔다
+# (글자가 아니었다면 되돌릴 방법이 없어서 노드 꾸러미가 남는다).
+try:
+    _clip_before = root.clipboard_get()
+except tk.TclError:
+    _clip_before = None
+
+import nodeclip
+
+_clip_tmp = tempfile.mkdtemp(prefix="nodeclip_")
+_clip_macros = os.path.join(_clip_tmp, "Macros")
+
+
+def _blank_macro(folder, name):
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, "macro.json")
+    with io.open(path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(graph_model.blank(name), ensure_ascii=False, indent=2))
+    return path
+
+
+def _open_macro(path):
+    app.macro = model.Macro.load(path)
+    app.apply_mode()
+    return app.canvas_view
+
+
+_src_dir = os.path.join(_clip_macros, "SrcMacro")
+_dst_dir = os.path.join(_clip_macros, "DstMacro")
+_clash_dir = os.path.join(_clip_macros, "ClashMacro")
+_src_json = _blank_macro(_src_dir, u"원본 매크로")
+_dst_json = _blank_macro(_dst_dir, u"대상 매크로")
+_clash_json = _blank_macro(_clash_dir, u"이름 겹침")
+shutil.copyfile(os.path.join(MACROS_REAL, "Example", "never_matches.png"),
+                os.path.join(_src_dir, "t.png"))
+# 같은 이름 다른 그림. 붙여넣기가 남의 그림을 덮어쓰면 안 된다.
+_other_png = tk.PhotoImage(width=4, height=4)
+_other_png.put("#ff0000", to=(0, 0, 4, 4))
+_other_png.write(os.path.join(_clash_dir, "t.png"), format="png")
+_clash_bytes = io.open(os.path.join(_clash_dir, "t.png"), "rb").read()
+
+_cv = _open_macro(_src_json)
+_cv.canvas.configure(width=900, height=700)
+_p1 = _cv.add_node("waitImage", 100, 100)
+_p1["image"] = "t.png"
+_p2 = _cv.add_node("click", 340, 100)
+_p3 = _cv.add_node("log", 580, 100)
+_cv.graph.connect(_p1["id"], "next", _p2["id"])
+_cv.graph.connect(_p2["id"], "next", _p3["id"])
+
+_cv.set_selection([_p1["id"], _p2["id"]])
+check(u"고른 노드를 복사한다", _cv.copy_selection() == 2)
+
+_packed = nodeclip.loads(root.clipboard_get())
+check(u"클립보드가 노드 꾸러미로 읽힌다", _packed is not None)
+check(u"고른 노드만 담긴다", len(_packed["nodes"]) == 2,
+      u"%r" % ([n["type"] for n in _packed["nodes"]],))
+check(u"선택 밖으로 나가는 연결은 빠진다", len(_packed["links"]) == 1,
+      u"%r" % (_packed["links"],))
+check(u"원본 폴더를 함께 담는다",
+      os.path.normcase(_packed["sourceDir"]) == os.path.normcase(_src_dir),
+      u"%s" % (_packed["sourceDir"],))
+
+# --- 같은 매크로 안에 붙여넣기
+_entry_before = _cv.graph.entry
+_new = _cv.paste_clipboard(at=(600, 400))
+check(u"같은 매크로에 붙여넣기", len(_new) == 2, u"%r" % (_new,))
+check(u"새 id 를 발급한다",
+      not (set(_new) & {_p1["id"], _p2["id"], _p3["id"]}), u"%r" % (_new,))
+check(u"노드가 늘어난다", len(_cv.graph.nodes) == 5, u"%d" % len(_cv.graph.nodes))
+check(u"꾸러미 안의 연결도 새 id 로 이어진다",
+      _cv.graph.target(_new[0], "next") == _new[1],
+      u"%r" % (_cv.graph.links,))
+check(u"놓은 자리에 붙는다",
+      min(int(_cv.graph.node(i)["ui"]["x"]) for i in _new) == 600,
+      u"%r" % ([_cv.graph.node(i)["ui"] for i in _new],))
+check(u"붙여넣은 노드가 선택된다", _cv.selected_nodes == set(_new))
+check(u"시작 노드는 그대로", _cv.graph.entry == _entry_before)
+check(u"같은 폴더면 이미지를 건드리지 않는다",
+      _cv.graph.node(_new[0])["image"] == "t.png"
+      and sorted(os.listdir(_src_dir)) == ["macro.json", "t.png"],
+      u"%r" % (sorted(os.listdir(_src_dir)),))
+
+# --- 다른 매크로에 붙여넣기: 이미지가 따라온다
+_cv = _open_macro(_dst_json)
+_new_b = _cv.paste_clipboard(at=(50, 50))
+check(u"다른 매크로에 붙여넣기", len(_new_b) == 2, u"%r" % (_new_b,))
+check(u"빈 그래프면 붙여넣은 첫 노드가 시작 노드",
+      _cv.graph.entry == _new_b[0], u"%r" % (_cv.graph.entry,))
+check(u"이미지가 대상 폴더로 따라온다",
+      os.path.isfile(os.path.join(_dst_dir, "t.png")))
+check(u"이미지 참조는 그대로",
+      _cv.graph.node(_new_b[0])["image"] == "t.png")
+
+# --- 이름이 겹치고 내용이 다르면 덮어쓰지 않는다
+_cv = _open_macro(_clash_json)
+_new_c = _cv.paste_clipboard(at=(50, 50))
+check(u"이름이 겹쳐도 원본 그림은 그대로",
+      io.open(os.path.join(_clash_dir, "t.png"), "rb").read() == _clash_bytes)
+check(u"겹치면 다른 이름으로 가져온다",
+      os.path.isfile(os.path.join(_clash_dir, "t (2).png")),
+      u"%r" % (sorted(os.listdir(_clash_dir)),))
+check(u"노드 참조도 새 이름으로 바뀐다",
+      _cv.graph.node(_new_c[0])["image"] == "t (2).png",
+      u"%r" % (_cv.graph.node(_new_c[0])["image"],))
+
+# --- 내용이 같으면 두 번 복사하지 않는다
+_cv = _open_macro(_dst_json)
+_again = _cv.paste_clipboard(at=(400, 400))
+check(u"같은 그림이 이미 있으면 다시 만들지 않는다",
+      not os.path.isfile(os.path.join(_dst_dir, "t (2).png"))
+      and _cv.graph.node(_again[0])["image"] == "t.png",
+      u"%r" % (sorted(os.listdir(_dst_dir)),))
+
+# --- 클립보드에 엉뚱한 것이 들어 있을 때
+check(u"아무 글자나 꾸러미로 읽지 않는다", nodeclip.loads(u"그냥 글자") is None)
+check(u"다른 JSON 도 거른다",
+      nodeclip.loads(json.dumps({"nodes": [{"type": "log"}]})) is None)
+root.clipboard_clear()
+root.clipboard_append(u"복사해 둔 평범한 글자")
+_before_count = len(_cv.graph.nodes)
+check(u"엉뚱한 클립보드로는 아무 일도 없다",
+      _cv.paste_clipboard() == [] and len(_cv.graph.nodes) == _before_count)
+
+# --- './' 하위 매크로 참조는 가족을 벗어나면 깨진다. 몰래 고치지 않고 알린다.
+_fam_dir = os.path.join(_clip_macros, "FamMacro")
+_fam_json = _blank_macro(_fam_dir, u"가족 부모")
+_blank_macro(os.path.join(_fam_dir, "Sub"), u"하위")
+_cv = _open_macro(_fam_json)
+_call = _cv.add_node("call", 0, 0)
+_call["macro"] = "./Sub"
+_cv.set_selection([_call["id"]])
+_cv.copy_selection()
+check(u"가족 안에서는 './' 참조가 멀쩡하다",
+      app.check_call_targets(only={_call["id"]}) == [],
+      u"%r" % (app.check_call_targets(only={_call["id"]}),))
+
+_cv = _open_macro(_dst_json)
+_broken = _cv.add_node("call", 700, 700)
+_broken["macro"] = "없는매크로"
+_pasted_call = _cv.paste_clipboard(at=(300, 300))
+_scoped = app.check_call_targets(only=set(_pasted_call))
+check(u"가족 밖에 붙인 './' 참조를 짚어 준다",
+      len(_scoped) == 1 and u"찾을 수 없습니다" in _scoped[0], u"%r" % (_scoped,))
+check(u"only 로 준 노드만 본다",
+      all(_broken["id"] not in line for line in _scoped)
+      and len(app.check_call_targets()) == 2,
+      u"%r" % (app.check_call_targets(),))
+
+# --- 조건 안에 든 이미지도 함께 바뀐다
+_cond_node = {"type": "if", "image": "a.png",
+              "condition": {"type": "all", "conditions": [
+                  {"type": "imageFound", "image": "b.png"},
+                  {"type": "not", "condition": {"type": "imageFound",
+                                                "image": "a.png"}}]}}
+schema.rewrite_images(_cond_node, {"a.png": "z.png"})
+check(u"조건 안쪽 이미지 이름까지 갈아 끼운다",
+      _cond_node["image"] == "z.png"
+      and _cond_node["condition"]["conditions"][1]["condition"]["image"] == "z.png"
+      and _cond_node["condition"]["conditions"][0]["image"] == "b.png",
+      u"%r" % (_cond_node,))
+
+# --- 키가 실제로 이 동작에 걸려 있는가. 메서드만 맞고 바인딩이 빠지면
+#     테스트는 통과하는데 편집기에서는 아무 일도 일어나지 않는다.
+#     키 이벤트는 event_generate 로 전달되지 않으므로(포커스를 탄다)
+#     바인딩 목록과 처리기를 나눠서 본다.
+_bound = _cv.canvas.bind()
+check(u"Ctrl+C / Ctrl+V 가 캔버스에 걸려 있다",
+      any("Control-Key-c" in b for b in _bound)
+      and any("Control-Key-v" in b for b in _bound), u"%r" % (_bound,))
+check(u"다른 위젯의 Ctrl+C 를 가로채지 않는다 (캔버스 위젯에만 건다)",
+      not any("Control-Key-c" in b for b in root.bind()), u"%r" % (root.bind(),))
+
+_cv = _open_macro(_src_json)
+_k1 = _cv.add_node("log", 40, 40)
+_cv.set_selection([_k1["id"]])
+root.clipboard_clear()
+root.clipboard_append(u"덮어쓸 평범한 글자")
+check(u"Ctrl+C 처리기가 복사를 한다",
+      _cv._on_copy() == "break"
+      and (nodeclip.loads(root.clipboard_get()) or {}).get("nodes") is not None)
+_before_keys = len(_cv.graph.nodes)
+check(u"Ctrl+V 처리기가 붙여넣기를 한다",
+      _cv._on_paste() == "break"
+      and len(_cv.graph.nodes) == _before_keys + 1, u"%d" % len(_cv.graph.nodes))
+
+# --- Ctrl+D 복제. 하나면 그 노드만, 여럿이면 노드 사이 연결까지 함께.
+_cv = _open_macro(_src_json)
+_d1 = _cv.add_node("log", 40, 40)
+_d1["message"] = u"원본"
+_cv.set_selection([_d1["id"]])
+_made = _cv.duplicate_selection()
+check(u"하나 고르면 그 노드만 복제한다",
+      len(_made) == 1 and len(_cv.graph.nodes) == 2
+      and _cv.graph.node(_made[0])["message"] == u"원본", u"%r" % (_made,))
+check(u"복제본이 선택되고 속성 패널이 그쪽을 본다",
+      _cv.selected_nodes == set(_made)
+      and app.current_step_obj is _cv.graph.node(_made[0]))
+
+_cv = _open_macro(_src_json)
+_d1 = _cv.add_node("log", 40, 40)
+_d2 = _cv.add_node("click", 300, 40)
+_d3 = _cv.add_node("log", 560, 40)
+_cv.graph.connect(_d1["id"], "next", _d2["id"])
+_cv.graph.connect(_d2["id"], "next", _d3["id"])
+_cv.set_selection([_d1["id"], _d2["id"]])
+_made = _cv.duplicate_selection()
+check(u"여럿 고르면 전부 복제한다",
+      len(_made) == 2 and len(_cv.graph.nodes) == 5, u"%r" % (_made,))
+check(u"복제본끼리의 연결이 살아 있다",
+      _cv.graph.target(_made[0], "next") == _made[1],
+      u"%r" % (_cv.graph.links,))
+check(u"선택 밖으로 나가던 연결은 따라오지 않는다",
+      _cv.graph.target(_made[1], "next") is None)
+
+_cv.set_selection([])
+_before = len(_cv.graph.nodes)
+check(u"아무것도 안 골랐으면 복제하지 않는다",
+      _cv.duplicate_selection() == [] and len(_cv.graph.nodes) == _before)
+
+_bound = _cv.canvas.bind()
+check(u"Ctrl+D 가 캔버스에 걸려 있다",
+      any("Control-Key-d" in b for b in _bound), u"%r" % (_bound,))
+check(u"Ctrl+D 를 루트에 걸지 않는다 (속성칸 타이핑을 방해하지 않게)",
+      not any("Control-Key-d" in b for b in root.bind()), u"%r" % (root.bind(),))
+_cv.set_selection([_d3["id"]])
+_before = len(_cv.graph.nodes)
+check(u"Ctrl+D 처리기가 복제를 한다",
+      _cv._on_duplicate() == "break"
+      and len(_cv.graph.nodes) == _before + 1, u"%d" % len(_cv.graph.nodes))
+
+shutil.rmtree(_clip_tmp, ignore_errors=True)
+root.clipboard_clear()
+if _clip_before is not None:
+    root.clipboard_append(_clip_before)
+
+
+section(u"속성칸을 Enter 없이 빠져나가도 값이 남는가")
+
+# Enter 를 치지 않고 다른 노드를 클릭하면 Tk 의 <FocusOut> 이 오기 전에
+# 속성 패널이 다시 지어져 입력칸이 파괴된다. 그래서 값이 사라졌다.
+# 여기서 보는 것은 "패널을 다시 짓기 전에 반영하는가" 다.
+_pf_tmp = tempfile.mkdtemp(prefix="propflush_")
+_pf_dir = os.path.join(_pf_tmp, "Macros", "PropFlush")
+_pf_json = _blank_macro(_pf_dir, u"속성 반영")
+_cv = _open_macro(_pf_json)
+_n_a = _cv.add_node("wait", 40, 40)        # 초 (숫자 칸)
+_n_b = _cv.add_node("type", 320, 40)       # 내용 (여러 줄 글자 칸)
+
+app.on_node_selected(_n_a["id"])
+_seconds = _field_entry(app.prop_frame, u"초")
+check(u"숫자 칸을 찾았다", _seconds is not None)
+
+_seconds.delete(0, "end")
+_seconds.insert(0, "2.5")
+check(u"Enter 전에는 아직 반영되지 않는다", _n_a.get("seconds") != 2.5,
+      u"%r" % (_n_a,))
+
+# 다른 노드를 고른다 = 편집기에서 노드를 클릭한 것과 같은 경로
+app.macro.dirty = False
+app.on_node_selected(_n_b["id"])
+check(u"노드를 바꾸면 방금 친 값이 들어간다", _n_a.get("seconds") == 2.5,
+      u"%r" % (_n_a,))
+check(u"바꾼 뒤에는 dirty 로 표시된다", app.macro.dirty)
+
+# 여러 줄 글자 칸도 같아야 한다
+_body = _field_text(app.prop_frame, u"내용")
+check(u"글자 칸을 찾았다", _body is not None)
+_body.delete("1.0", "end")
+_body.insert("1.0", u"안 친 채로 나감")
+app.on_node_selected(_n_a["id"])
+check(u"글자 칸도 노드를 바꾸면 들어간다",
+      _n_b.get("text") == u"안 친 채로 나감", u"%r" % (_n_b,))
+
+# 저장/실행 직전에도 반영되어야 한다. dirty 가 아니면 저장을 건너뛰므로
+# 옛 파일이 실행된다.
+_seconds = _field_entry(app.prop_frame, u"초")
+_seconds.delete(0, "end")
+_seconds.insert(0, "7")
+app.macro.dirty = False
+app.flush_property_edits()
+check(u"flush 만으로도 값이 들어간다", _n_a.get("seconds") == 7.0, u"%r" % (_n_a,))
+check(u"flush 가 dirty 를 세운다", app.macro.dirty)
+
+# 한 번 반영한 값을 두 번 쓰지 않는다 - 반복해서 부를 수 있어야 한다
+app.macro.dirty = False
+app.flush_property_edits()
+check(u"건드리지 않았으면 flush 가 아무 일도 하지 않는다", not app.macro.dirty)
+
+# 건드리지 않은 칸은 다시 쓰지 않는다. 반복 노드의 횟수/조건처럼 서로를
+# 지우는 필드가 있어서, 지나치기만 해도 commit 이 돌면 조건이 날아간다.
+_n_r = _cv.add_node("repeat", 600, 40)
+_n_r["while"] = {"type": "imageExists", "image": "x.png"}
+_n_r["maxIterations"] = 5
+app.on_node_selected(_n_r["id"])
+app.flush_property_edits()
+check(u"건드리지 않은 칸은 조건을 지우지 않는다", "while" in _n_r, u"%r" % (_n_r,))
+
+# 조건 편집기 안의 칸도 같은 길을 지난다. 조건 종류를 바꾸면 아래 칸들이
+# 통째로 갈리므로, 거기서도 먼저 반영해야 한다.
+_n_if = _cv.add_node("if", 900, 40)
+_n_if["condition"] = {"type": "textExists", "text": u"옛 글자"}
+app.on_node_selected(_n_if["id"])
+_text_entry = _field_entry(app.prop_frame, u"찾을 글자")
+check(u"조건 안의 칸을 찾았다", _text_entry is not None)
+_text_entry.delete(0, "end")
+_text_entry.insert(0, u"새 글자")
+app.on_node_selected(_n_a["id"])
+check(u"조건 안의 칸도 노드를 바꾸면 들어간다",
+      _n_if["condition"].get("text") == u"새 글자", u"%r" % (_n_if,))
+
+# 저장 경로에도 걸려 있어야 한다
+app.on_node_selected(_n_a["id"])
+_field_entry(app.prop_frame, u"초").delete(0, "end")
+_field_entry(app.prop_frame, u"초").insert(0, "3")
+app.macro.dirty = False
+app.save_macro()
+_saved = json.loads(io.open(_pf_json, encoding="utf-8-sig").read())
+check(u"Ctrl+S 도 안 들어간 값을 먼저 반영한다",
+      any(n.get("seconds") == 3.0 for n in _saved.get("nodes", [])),
+      u"%r" % (_saved.get("nodes"),))
+
+shutil.rmtree(_pf_tmp, ignore_errors=True)
+
+
+section(u"실행 종료 알림")
+
+check(u"알림 켜기가 기본값", app.notify_var.get())
+_notified = []
+_orig_notify = notify.notify
+notify.notify = lambda title, message, on_error=None: (
+    _notified.append((title, message)) or True)
+try:
+    app.job = None
+    app.macro.data["name"] = u"알림 매크로"
+    app._notify_run_done(0, False)
+    check(u"정상 종료를 알린다",
+          len(_notified) == 1 and u"알림 매크로" in _notified[0][0]
+          and _notified[0][1] == u"정상 종료", u"%r" % (_notified,))
+    app._notify_run_done(1, False)
+    check(u"실패도 알린다", _notified[-1][1] == u"단계 실패로 중단",
+          u"%r" % (_notified[-1],))
+    app._notify_run_done(2, True)
+    check(u"사용자가 중지한 것은 그렇게 알린다",
+          _notified[-1][1] == u"중지했습니다", u"%r" % (_notified[-1],))
+
+    del _notified[:]
+    app.notify_var.set(False)
+    app._notify_run_done(0, False)
+    check(u"꺼 두면 알리지 않는다", _notified == [], u"%r" % (_notified,))
+finally:
+    notify.notify = _orig_notify
+    app.notify_var.set(True)
+
+check(u"이 환경에서 알림을 띄울 수 있다", notify.available())
+check(u"XML 특수문자를 막는다",
+      notify._escape(u"a'b<c&d") == u"a&apos;b&lt;c&amp;d",
+      notify._escape(u"a'b<c&d"))
+_multiline = u"위" + chr(10) + u"아래"
+check(u"줄바꿈을 한 줄로 줄인다",
+      notify._escape(_multiline) == u"위 아래", notify._escape(_multiline))
+
+
 section(u"하위 매크로 (UE BP의 '함수')")
 
 _fam_tmp = tempfile.mkdtemp(prefix="family_")
@@ -2107,6 +2509,74 @@ try:
 finally:
     macro_editor.MACROS_DIR = _saved_macros_dir
     shutil.rmtree(_fam_tmp, ignore_errors=True)
+
+section(u"시작 노드로 이동")
+
+_bar_texts = []
+for child in app.root.winfo_children():
+    for widget in child.winfo_children() if hasattr(child, "winfo_children") else []:
+        try:
+            _bar_texts.append(widget.cget("text"))
+        except Exception:
+            pass
+check(u"툴바에 '시작 노드로 이동' 버튼이 있다",
+      any(t and u"시작 노드로 이동" in t for t in _bar_texts),
+      u"%r" % (_bar_texts,))
+
+app.macro = model.Macro(graph_model.blank(u"시작 노드 이동"))
+app.current_path = None
+app.apply_mode()
+_gcv = app.canvas_view
+_gcv.reset_view()
+check(u"노드가 없으면 이동할 곳도 없다", _gcv.focus_entry() is False)
+
+# 다른 매크로를 열었을 때처럼, 지금 보는 자리에서 아주 멀리 떨어진 노드
+_away = _gcv.add_node("log", 4000, 3000)["id"]
+_gcv.add_node("log", 4000, 3400)
+root.update_idletasks()
+check(u"처음 만든 노드가 시작 노드", _gcv.graph.entry == _away)
+
+
+def _view_size():
+    """center_on_node 와 같은 규칙으로 캔버스 크기를 잰다 (아직 안 그려졌으면 기본값)."""
+    w = _gcv.canvas.winfo_width()
+    h = _gcv.canvas.winfo_height()
+    return (w, h) if w > 1 and h > 1 else (800, 600)
+
+
+_vw, _vh = _view_size()
+_r = _gcv.node_rect(_gcv.graph.node(_away))
+check(u"이동 전에는 화면 밖에 있다",
+      _r[0] > _vw or _r[1] > _vh, u"%r / %r" % (_r, (_vw, _vh)))
+
+_gcv.zoom = 0.75
+_keep = set(_gcv.selected_nodes)
+app.goto_entry_node()
+_r = _gcv.node_rect(_gcv.graph.node(_away))
+check(u"시작 노드가 화면 한가운데로 온다",
+      abs((_r[0] + _r[2]) / 2.0 - _vw / 2.0) < 1.0
+      and abs((_r[1] + _r[3]) / 2.0 - _vh / 2.0) < 1.0,
+      u"%r / %r" % (_r, (_vw, _vh)))
+check(u"배율은 그대로 둔다", abs(_gcv.zoom - 0.75) < 1e-6, u"%r" % (_gcv.zoom,))
+check(u"선택은 건드리지 않는다", _gcv.selected_nodes == _keep,
+      u"%r -> %r" % (_keep, _gcv.selected_nodes))
+
+# 시작 노드를 옮겨 지정하면 그쪽으로 간다
+_second = [n["id"] for n in _gcv.graph.nodes if n["id"] != _away][0]
+_gcv.graph.entry = _second
+app.goto_entry_node()
+_r = _gcv.node_rect(_gcv.graph.node(_second))
+check(u"시작 노드를 바꾸면 그 노드로 간다",
+      abs((_r[0] + _r[2]) / 2.0 - _vw / 2.0) < 1.0
+      and abs((_r[1] + _r[3]) / 2.0 - _vh / 2.0) < 1.0, u"%r" % (_r,))
+
+# 트리 형식에서는 캔버스가 없다. 죽지 않고 안내만 한다.
+app.macro = model.Macro({"name": u"트리", "version": 1, "steps": []})
+app.current_path = None
+app.apply_mode()
+app.goto_entry_node()
+check(u"트리 형식에서는 안내만 하고 넘어간다",
+      u"노드 모드" in app.status.get(), u"%r" % (app.status.get(),))
 
 print("")
 print("=" * 62)

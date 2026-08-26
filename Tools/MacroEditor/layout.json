@@ -1,10 +1,11 @@
 {
-  "geometry": "2048x1061+-7+104",
+  "geometry": "2048x1061+-2015+-17",
   "layout": {
     "areas": {
       "left": [
         "library",
-        "project"
+        "project",
+        "submacros"
       ],
       "center": [
         "graph"
@@ -18,14 +19,15 @@
     },
     "sashes": {
       "outer": [
-        816
+        817
       ],
       "top": [
-        355,
-        1352
+        356,
+        1598
       ],
       "left": [
-        273
+        253,
+        450
       ]
     }
   },
@@ -34,7 +36,8 @@
     "Common",
     "Example",
     "ExampleGraph",
-    "MBM_CharSelect"
+    "MBM_Daily"
   ],
-  "last_macro": "D:\\Programming\\Oculix-Automation\\Macros\\MBM_Run_Dungeon\\macro.json"
+  "last_macro": "D:\\Programming\\Oculix-Automation\\Macros\\MBM_Daily\\MBM_Run_Dungeon\\macro.json",
+  "notify_on_done": true
 }

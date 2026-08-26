@@ -1389,20 +1389,68 @@ def _adopt_parent_context(macro, base_dir):
     return macro, root_dir, root_dir
 
 
-def make_engine(macro, base_dir, logger=None, start_node=None):
+def _standalone_params(macro):
+    """단독 실행(편집기의 F5 / Shift+F5)일 때 쓸 매개변수 값.
+
+    호출로 들어올 때는 _run_call 이 bind_params 로 값을 만들어 준다.
+    단독 실행에는 값을 넘겨주는 쪽이 없어서 예전에는 매개변수가 전부 비어
+    있었고, 선언에 기본값을 적어 둔 것까지 None 으로 읽혔다. 조건 비교가
+    말없이 어긋나는 원인이라 여기서 선언의 기본값을 그대로 적용한다.
+
+    기본값이 없는 매개변수는 채울 방법이 없으므로 비워 두고 알리기만 한다 -
+    여기서 실행을 막으면 매개변수를 가진 매크로는 단독으로 열어 볼 수 없다.
+
+    반환: (값 dict, 알릴 줄 목록)
+    """
+    values = {}
+    notes = []
+    missing = []
+    for param in graph_model.declared_params(macro):
+        name = param.get("name")
+        if not name:
+            continue
+        if "default" not in param:
+            missing.append(name)
+            continue
+        try:
+            values[name] = graph_model.coerce_param(
+                param["default"], param.get("type"), u"매개변수 '%s'" % name)
+        except graph_model.ParamError as exc:
+            missing.append(name)
+            notes.append(u"매개변수 '%s' 의 기본값을 쓸 수 없습니다: %s"
+                         % (name, exc))
+    if values:
+        notes.append(u"단독 실행 - 매개변수 기본값을 씁니다: %s"
+                     % u", ".join(u"%s=%s" % (k, values[k])
+                                  for k in sorted(values)))
+    if missing:
+        notes.append(u"단독 실행 - 기본값이 없어 비워 둔 매개변수: %s"
+                     % u", ".join(sorted(missing)))
+    return values, notes
+
+
+def make_engine(macro, base_dir, logger=None, start_node=None, params=None):
     """형식을 보고 트리/그래프 실행기를 고른다.
 
     `start_node` 는 이번 실행만 그 노드에서 시작하게 한다. 노드라는 개념이
     없는 트리 형식에는 쓸 수 없다.
+
+    `params` 를 주지 않으면 선언된 기본값으로 채운다 (_standalone_params).
     """
     macro, base_dir, adopted = _adopt_parent_context(macro, base_dir)
+    notes = []
+    if params is None:
+        params, notes = _standalone_params(macro)
     if graph_model.is_graph(macro):
-        engine = GraphEngine(macro, base_dir, logger, start_node=start_node)
+        engine = GraphEngine(macro, base_dir, logger, start_node=start_node,
+                             params=params)
     else:
         if start_node:
             raise MacroError("start node is only supported for graph macros")
-        engine = Engine(macro, base_dir, logger)
+        engine = Engine(macro, base_dir, logger, params=params)
     if adopted:
         engine.log(u"하위 매크로 - 부모(%s)의 설정과 이미지 폴더를 사용합니다"
                    % os.path.basename(adopted))
+    for line in notes:
+        engine.log(line)
     return engine

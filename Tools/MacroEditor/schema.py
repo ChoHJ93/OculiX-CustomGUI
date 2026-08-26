@@ -461,6 +461,37 @@ def image_params(step):
     return out
 
 
+def rewrite_condition_images(cond, mapping):
+    """조건 안의 이미지 이름을 바꾼다. `condition_images` 와 짝이다."""
+    if not isinstance(cond, dict):
+        return
+    name = cond.get("image")
+    if name and name in mapping:
+        cond["image"] = mapping[name]
+    if isinstance(cond.get("condition"), dict):
+        rewrite_condition_images(cond["condition"], mapping)
+    for sub in cond.get("conditions") or []:
+        rewrite_condition_images(sub, mapping)
+
+
+def rewrite_images(step, mapping):
+    """단계/노드의 이미지 이름을 {옛 이름: 새 이름} 으로 갈아 끼운다.
+
+    `image_params` 가 훑는 자리를 그대로 훑는다. 한쪽만 고치면 다른 매크로로
+    복사할 때 그림을 못 찾는 노드가 생기므로 두 함수를 나란히 둔다.
+    """
+    if not mapping:
+        return
+    if step.get("image") in mapping:
+        step["image"] = mapping[step["image"]]
+    for key in ("from", "to"):
+        sub = step.get(key)
+        if isinstance(sub, dict) and sub.get("image") in mapping:
+            sub["image"] = mapping[sub["image"]]
+    for key in ("condition", "while"):
+        rewrite_condition_images(step.get(key), mapping)
+
+
 def summarize(step):
     """트리에 한 줄로 표시할 요약 문자열."""
     stype = step.get("type", u"?")

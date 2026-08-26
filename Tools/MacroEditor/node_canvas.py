@@ -6,6 +6,8 @@
     빈 곳에서 드래그      사각형 범위 선택. 범위 안에 **완전히** 들어온 노드만 잡힌다
     Ctrl + 클릭          선택에 추가          (빈 곳에서 드래그하면 범위만큼 추가)
     Alt + 클릭           선택에서 제외        (빈 곳에서 드래그하면 범위만큼 제외)
+    Ctrl + C / Ctrl + V  고른 노드 복사 / 붙여넣기 (다른 매크로에도 붙는다)
+    Ctrl + D             고른 노드 복제 (여러 개면 노드 사이 연결까지 함께)
     출력 핀에서 드래그    다른 노드에 놓으면 연결 / 빈 곳에 놓으면 해제
     연결선 클릭 후 Delete 연결 삭제
     Delete               선택한 노드 전부 삭제
@@ -20,6 +22,9 @@
 `selected_node` 에 값을 넣으면 선택이 그 하나로 초기화된다.
 
 노드에는 핀 타입(Exec)과, 이미지 매개변수가 있으면 그 이미지의 썸네일이 함께 그려진다.
+
+복사/붙여넣기는 클립보드에 JSON 글자로 오간다. 옮길 때 노드 id 를 새로 발급하고
+이미지 파일까지 따라 옮기는 규칙은 `nodeclip.py` 에 있다.
 """
 
 import copy
@@ -35,6 +40,7 @@ sys.path.insert(0, os.path.normpath(os.path.join(
 
 import graph_model
 import imagecache
+import nodeclip
 import schema
 import theme
 
@@ -145,6 +151,14 @@ class NodeCanvas(ttk.Frame):
         c.bind("<Configure>", lambda e: self.redraw())
         c.bind("<Delete>", lambda e: self.delete_selection())
         c.bind("<Double-Button-1>", self._on_double_click)
+        # 캔버스 위젯에만 건다. 속성 패널의 입력칸에서는 평소대로 글자가 복사된다.
+        # 대문자 쪽은 Shift 나 CapsLock 이 걸린 채로 눌렀을 때를 위한 것이다.
+        c.bind("<Control-c>", self._on_copy)
+        c.bind("<Control-C>", self._on_copy)
+        c.bind("<Control-v>", self._on_paste)
+        c.bind("<Control-V>", self._on_paste)
+        c.bind("<Control-d>", self._on_duplicate)
+        c.bind("<Control-D>", self._on_duplicate)
         c.configure(takefocus=True)
 
     # ------------------------------------------------------------------ 선택
@@ -861,6 +875,7 @@ class NodeCanvas(ttk.Frame):
             self.redraw()
         menu = tk.Menu(self, tearoff=0)
         theme.style_menu(menu)
+        wx, wy = self.to_world(event.x, event.y)   # 붙여넣기를 놓을 자리
         if node_id:
             node = self.graph.node(node_id)
             # 노드를 하나만 골랐을 때만. 여러 개면 어디서 시작할지 모호하다.
@@ -872,13 +887,23 @@ class NodeCanvas(ttk.Frame):
                              command=lambda: self._set_entry(node_id))
             state = u"사용 안 함으로" if node.get("enabled") is not False else u"다시 사용"
             menu.add_command(label=state, command=lambda: self._toggle(node_id))
-            menu.add_command(label=u"복제", command=lambda: self._duplicate(node_id))
+            count = len(self.selected_nodes)
+            menu.add_command(
+                label=(u"선택한 노드 %d개 복제 (Ctrl+D)" % count) if count > 1
+                      else u"복제 (Ctrl+D)",
+                command=self.duplicate_selection)
+            menu.add_separator()
+            menu.add_command(
+                label=(u"선택한 노드 %d개 복사 (Ctrl+C)" % count) if count > 1
+                      else u"복사 (Ctrl+C)",
+                command=self.copy_selection)
+            menu.add_command(label=u"붙여넣기 (Ctrl+V)",
+                             command=lambda x=wx, y=wy: self.paste_clipboard((x, y)))
             if node.get("type") == "call":
                 menu.add_separator()
                 menu.add_command(label=u"호출 대상 열기",
                                  command=lambda: self.app.open_macro_ref(node.get("macro")))
             menu.add_separator()
-            count = len(self.selected_nodes)
             if count > 1 and node_id in self.selected_nodes:
                 picked = list(self.selected_nodes)
                 menu.add_command(label=u"선택한 노드 %d개 삭제" % count,
@@ -887,7 +912,6 @@ class NodeCanvas(ttk.Frame):
                 menu.add_command(label=u"삭제",
                                  command=lambda: self._delete_node(node_id))
         else:
-            wx, wy = self.to_world(event.x, event.y)
             add = tk.Menu(menu, tearoff=0)
             theme.style_menu(add)
             for group, entries in schema.grouped_types().items():
@@ -899,6 +923,8 @@ class NodeCanvas(ttk.Frame):
                         command=lambda t=stype, x=wx, y=wy: self.add_node(t, x, y))
                 add.add_cascade(label=group, menu=sub)
             menu.add_cascade(label=u"노드 추가", menu=add)
+            menu.add_command(label=u"붙여넣기 (Ctrl+V)",
+                             command=lambda x=wx, y=wy: self.paste_clipboard((x, y)))
             menu.add_separator()
             menu.add_command(label=u"보기 초기화", command=self.reset_view)
             menu.add_command(label=u"자동 정렬", command=self.auto_layout)
@@ -1032,11 +1058,173 @@ class NodeCanvas(ttk.Frame):
         self.selected_node = clone["id"]
         self.app.mark_dirty()
         self.redraw()
+        # 선택이 복제본으로 옮겨 갔으니 속성 패널도 그쪽을 보게 한다.
+        # 알리지 않으면 원본을 편집 중인 것처럼 보인다.
+        self._notify_active(force=True)
+        return [clone["id"]]
+
+    # ------------------------------------------------- 복사 / 붙여넣기
+
+    def _on_copy(self, _event=None):
+        self.copy_selection()
+        return "break"
+
+    def _on_paste(self, _event=None):
+        self.paste_clipboard(at=self._pointer_world())
+        return "break"
+
+    def _on_duplicate(self, _event=None):
+        self.duplicate_selection()
+        return "break"
+
+    def duplicate_selection(self):
+        """고른 노드를 그 자리 옆에 복제한다. 새로 생긴 노드 id 목록.
+
+        하나만 골랐으면 예전 '복제' 와 같다. 여럿이면 노드 사이의 연결까지
+        살려야 하는데 그 규칙은 이미 nodeclip 에 있으므로 복사/붙여넣기
+        경로를 그대로 쓴다. 그 대가로 클립보드 내용은 덮어쓰인다.
+        """
+        if self.graph is None:
+            return []
+        if not self.selected_nodes:
+            self.app.log_line(u"복제할 노드를 먼저 고르세요", "err")
+            return []
+        if len(self.selected_nodes) == 1:
+            return self._duplicate(next(iter(self.selected_nodes)))
+        if not self.copy_selection():
+            return []
+        return self.paste_clipboard()
+
+    def _pointer_world(self):
+        """마우스가 캔버스 위에 있으면 그 자리의 월드 좌표. 밖이면 None."""
+        c = self.canvas
+        try:
+            sx = c.winfo_pointerx() - c.winfo_rootx()
+            sy = c.winfo_pointery() - c.winfo_rooty()
+        except tk.TclError:
+            return None
+        if 0 <= sx < c.winfo_width() and 0 <= sy < c.winfo_height():
+            return self.to_world(sx, sy)
+        return None
+
+    def copy_selection(self):
+        """고른 노드를 클립보드에 담는다. 담은 개수를 돌려준다.
+
+        노드 사이의 연결도 함께 담는다. 선택 밖으로 나가던 연결은 뺀다 -
+        붙여넣는 곳에 그 상대가 없기 때문이다.
+        """
+        if self.graph is None or not self.selected_nodes:
+            self.app.log_line(u"복사할 노드를 먼저 고르세요", "err")
+            return 0
+        macro = getattr(self.app, "macro", None)
+        payload = nodeclip.pack(
+            self.graph, self.selected_nodes, source_dir=self.base_dir,
+            source_name=(macro.data.get("name") if macro else u"") or u"")
+        if payload is None:
+            return 0
+        try:
+            self.canvas.clipboard_clear()
+            self.canvas.clipboard_append(nodeclip.dumps(payload))
+        except tk.TclError as exc:
+            self.app.log_line(u"클립보드에 담지 못했습니다: %s" % exc, "err")
+            return 0
+        self.app.log_line(u"노드 %d개 복사 (연결 %d개)"
+                          % (len(payload["nodes"]), len(payload["links"])), "ok")
+        return len(payload["nodes"])
+
+    def paste_clipboard(self, at=None):
+        """클립보드의 노드 꾸러미를 심는다. 새로 생긴 노드 id 목록.
+
+        `at` 은 놓을 월드 좌표(꾸러미의 왼쪽 위 모서리 기준). 없으면 원래
+        자리에서 조금 밀어 놓는다.
+        """
+        if self.graph is None:
+            return []
+        try:
+            text = self.canvas.clipboard_get()
+        except tk.TclError:
+            text = None                  # 클립보드가 비었거나 글자가 아니다
+        payload = nodeclip.loads(text)
+        if payload is None:
+            self.app.log_line(u"클립보드에 붙여넣을 노드가 없습니다", "err")
+            return []
+
+        image_map, notes, copied = nodeclip.import_images(payload,
+                                                          self.base_dir)
+        for tag, line in notes:
+            self.app.log_line(line, tag)
+        if copied:
+            # 폴더에 파일이 늘었다. 프로젝트 패널이 낡은 목록을 들고 있으면
+            # 방금 가져온 그림이 없는 것처럼 보인다.
+            refresh = getattr(self.app, "refresh_project", None)
+            if refresh:
+                refresh()
+
+        new_ids = nodeclip.paste(self.graph, payload, at=at, image_map=image_map)
+        if not new_ids:
+            return []
+        self.app.mark_dirty()
+        self.set_selection(new_ids, active=new_ids[0])
+        self.redraw()
+        self._notify_active(force=True)
+        source = payload.get("sourceName")
+        self.app.log_line(u"노드 %d개 붙여넣기%s"
+                          % (len(new_ids),
+                             (u" (원본: %s)" % source) if source else u""), "ok")
+        self._warn_pasted_calls(new_ids)
+        return new_ids
+
+    def _warn_pasted_calls(self, node_ids):
+        """붙여넣은 호출 노드가 여기서도 유효한지 기존 검사로 확인한다.
+
+        `./이름` 하위 매크로 참조는 그 가족 안에서만 뜻이 있어서, 다른
+        매크로에 붙이면 가리킬 곳이 없어진다. 참조를 몰래 고치는 대신
+        어디가 깨졌는지 바로 알린다.
+        """
+        check = getattr(self.app, "check_call_targets", None)
+        if check is None:
+            return
+        ids = set(node_ids)
+        if not any((self.graph.node(i) or {}).get("type") == "call"
+                   for i in ids):
+            return
+        for line in check(only=ids):
+            self.app.log_line(u"주의: %s" % line, "err")
 
     def reset_view(self):
         self.zoom = 1.0
         self.origin = [40.0, 40.0]
         self.redraw()
+
+    def center_on_node(self, node_id):
+        """노드 하나를 화면 한가운데로 끌어온다. 배율과 선택은 건드리지 않는다.
+
+        노드를 옮기는 것이 아니라 보는 위치(origin)만 옮긴다.
+        아래쪽 `focus_node` 와 헷갈리지 않게 이름을 나눠 뒀다 -
+        그쪽은 선택만 바꾸고 화면은 그대로 둔다.
+        """
+        node = self.graph.node(node_id) if self.graph else None
+        if node is None:
+            return False
+        # 방금 만들어진 패널은 아직 크기가 없다. 그리기 전에 실제 크기를 받아 온다.
+        self.canvas.update_idletasks()
+        w = self.canvas.winfo_width()
+        h = self.canvas.winfo_height()
+        if w <= 1 or h <= 1:
+            w, h = 800, 600
+        x, y = self._pos(node)
+        cx = x + NODE_W / 2.0
+        cy = y + self.node_height(node) / 2.0
+        self.origin[0] = w / 2.0 - cx * self.zoom
+        self.origin[1] = h / 2.0 - cy * self.zoom
+        self.redraw()
+        return True
+
+    def focus_entry(self):
+        """시작 노드를 화면 한가운데로. 시작 노드가 없으면 False."""
+        if self.graph is None or not self.graph.entry:
+            return False
+        return self.center_on_node(self.graph.entry)
 
     def auto_layout(self):
         """시작 노드부터 폭 우선으로 훑어 열/행에 배치한다."""

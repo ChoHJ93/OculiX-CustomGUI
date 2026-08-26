@@ -1094,6 +1094,57 @@ check(u"필수 값을 빠뜨리면 호출하지 않는다", "GREETER" not in mar
 check(u"무엇이 빠졌는지 알려 준다",
       u"매개변수 오류" in _text and u"who" in _text)
 
+# 단독 실행(편집기의 F5 / Shift+F5)에는 값을 넘겨주는 쪽이 없다.
+# 예전에는 매개변수가 전부 비어 있어서, 기본값을 적어 둔 것까지 None 으로
+# 읽혔고 비교 조건이 말없이 어긋났다. 선언의 기본값이 쓰여야 한다.
+_solo = graph_model.Graph(graph_model.blank(u"단독 실행"))
+_solo.data["params"] = [{"name": "count", "type": "int", "default": 1},
+                        {"name": "flag", "type": "bool", "default": True},
+                        {"name": "who", "type": "string"}]
+_s0 = log_node(_solo, "SOLO")
+_s1 = _solo.add_node({"type": "if", "condition": {
+    "type": "paramCompare", "param": "count", "op": "==", "value": "1"}}, 240, 0)
+_sok = log_node(_solo, "DEFAULT-USED", 480, -60)
+_sbad = log_node(_solo, "DEFAULT-LOST", 480, 60)
+_solo.entry = _s0["id"]
+_solo.connect(_s0["id"], "next", _s1["id"])
+_solo.connect(_s1["id"], "true", _sok["id"])
+_solo.connect(_s1["id"], "false", _sbad["id"])
+_code, _lines, _text = run_graph(_solo, "ParamSolo")
+check(u"단독 실행이 선언의 기본값을 쓴다",
+      marks(_lines) == ["SOLO", "DEFAULT-USED"], u"%r" % (marks(_lines),))
+check(u"어떤 기본값을 썼는지 알려 준다",
+      u"매개변수 기본값을 씁니다" in _text and u"count=1" in _text)
+check(u"기본값이 없는 것은 비워 두고 알린다",
+      u"기본값이 없어 비워 둔 매개변수: who" in _text)
+
+# 중간 노드부터 돌려도(Shift+F5) 마찬가지다 - 시작 지점만 다를 뿐이다
+_code, _lines, _text = run_graph(_solo, "ParamSoloFrom", start_node=_s1["id"])
+check(u"노드부터 실행해도 기본값이 들어간다",
+      marks(_lines) == ["DEFAULT-USED"], u"%r" % (marks(_lines),))
+
+# 하위 매크로를 편집기에서 열어 바로 돌리는 경우도 같아야 한다.
+# 부모 문맥(_adopt_parent_context)을 물려받은 뒤에도 기본값이 살아 있는가.
+_pfam = graph_model.Graph(graph_model.blank(u"기본값 부모"))
+_pfam.data["settings"]["defaultSimilarity"] = 0.77
+log_node(_pfam, "PARENT")
+save_named(_pfam, "ParamFam")
+_sub = graph_model.Graph(graph_model.blank(u"기본값 하위"))
+_sub.data["params"] = [{"name": "count", "type": "int", "default": 4}]
+_u0 = log_node(_sub, "SUB")
+_u1 = _sub.add_node({"type": "if", "condition": {
+    "type": "paramCompare", "param": "count", "op": "==", "value": "4"}}, 240, 0)
+_uok = log_node(_sub, "SUB-DEFAULT-USED", 480, -60)
+_ubad = log_node(_sub, "SUB-DEFAULT-LOST", 480, 60)
+_sub.entry = _u0["id"]
+_sub.connect(_u0["id"], "next", _u1["id"])
+_sub.connect(_u1["id"], "true", _uok["id"])
+_sub.connect(_u1["id"], "false", _ubad["id"])
+_code, _lines, _text = run_graph_path(
+    save_named(_sub, os.path.join("ParamFam", "ParamSub")))
+check(u"하위 매크로 단독 실행에서도 기본값이 들어간다",
+      marks(_lines) == ["SUB", "SUB-DEFAULT-USED"], u"%r" % (marks(_lines),))
+
 # 선언에 없는 이름을 넘기면 조용히 무시하지 않는다
 _code, _lines, _text = call_with({"who": "a", "typo": 1}, "ParamStale")
 check(u"선언에 없는 값은 조용히 넘기지 않는다",
