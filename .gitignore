@@ -17,6 +17,10 @@ Logs/*
 
 # ── 이 PC에 종속된 런타임 캐시 (해상도별 OCR 좌표) ──────────
 tesseract-lastseen.json
+
+# ── 편집기 개인 설정 (창 위치·도크 배치·마지막 연 매크로) ───
+#    없으면 settings.DEFAULTS 로 돌아가므로 실행에 필요 없다
+Tools/MacroEditor/layout.json
 Docs/env-backup-*.txt
 
 # ── OS / 편집기 ─────────────────────────────────────────────
