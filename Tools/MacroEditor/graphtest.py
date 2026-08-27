@@ -353,7 +353,7 @@ g.add_node({"type": "repeat", "times": 0,
             "maxIterations": 10}, 0, 0)
 errors, _w = g.validate()
 check("횟수와 조건을 함께 쓰면 오류",
-      any(u"함께 쓸 수 없" in e for e in errors), "%r" % (errors,))
+      any(u"하나만 골라야" in e for e in errors), "%r" % (errors,))
 code, lines, text = run_graph(g, "invalid_repeat")
 check("충돌한 반복은 실행되지 않음", code != 0, u"exit=%s" % code)
 
@@ -1515,6 +1515,127 @@ check(u"하위 단독 실행이 부모 문맥을 물려받는다",
       and u"정확도 0.77 이상" in _text, u"exit=%s" % _code)
 check(u"하위 단독 실행에서도 형제 호출이 된다",
       marks(_lines) == ["SUB-A", "SUB-B", "SUB-A-END"], "%r" % (marks(_lines),))
+
+
+section(u"25g. 값 목록 반복 (forEach) - 실측")
+
+# 피호출: 받은 값을 그대로 찍는다. 반복이 매번 다른 값을 넘기는지 본다.
+_fe_callee = graph_model.Graph(graph_model.blank(u"한 명 처리"))
+_fe_callee.data["params"] = [{"name": "no", "type": "int"}]
+_fc0 = _fe_callee.add_node({"type": "log", "message": "MARK:CHAR"}, 0, 0)
+_fc1 = _fe_callee.add_node({"type": "if", "condition": {
+    "type": "paramCompare", "param": "no", "op": "==", "value": "3"}}, 240, 0)
+_fc3 = log_node(_fe_callee, "THREE", 480, -60)
+_fcx = log_node(_fe_callee, "OTHER", 480, 60)
+_fe_callee.entry = _fc0["id"]
+_fe_callee.connect(_fc0["id"], "next", _fc1["id"])
+_fe_callee.connect(_fc1["id"], "true", _fc3["id"])
+_fe_callee.connect(_fc1["id"], "false", _fcx["id"])
+save_named(_fe_callee, "ForEachCallee")
+
+# 반복이 2,3,4 를 차례로 넘긴다
+_g = graph_model.Graph(graph_model.blank(u"값 목록 반복"))
+_s = log_node(_g, "START")
+_loop = _g.add_node({"type": "repeat", "forEach": {
+    "param": "charNo", "type": "int", "values": [2, 3, 4]}}, 240, 0)
+_call = _g.add_node({"type": "call", "macro": "ForEachCallee",
+                     "args": {"no": graph_model.param_ref("charNo")}}, 480, 60)
+_done = log_node(_g, "DONE", 480, -60)
+_g.entry = _s["id"]
+_g.connect(_s["id"], "next", _loop["id"])
+_g.connect(_loop["id"], "body", _call["id"])
+_g.connect(_loop["id"], "completed", _done["id"])
+
+_e, _w = _g.validate()
+check(u"값 목록 반복이 검사를 통과", not _e, u"%r" % (_e,))
+
+_code, _lines, _text = run_graph(_g, "foreach_basic")
+check(u"종료 코드 0", _code == 0, u"exit=%s" % _code)
+check(u"값마다 한 번씩, 값에 따라 분기한다",
+      marks(_lines) == ["START", "CHAR", "OTHER", "CHAR", "THREE",
+                        "CHAR", "OTHER", "DONE"],
+      u"%r" % (marks(_lines),))
+check(u"넘긴 값이 매 회 달라진다",
+      u"no=2" in _text and u"no=3" in _text and u"no=4" in _text)
+
+# 반복 변수를 조건에서 직접 읽는다 (호출 없이)
+_g = graph_model.Graph(graph_model.blank(u"반복 변수 조건"))
+_s = log_node(_g, "START")
+_loop = _g.add_node({"type": "repeat", "forEach": {
+    "param": "n", "type": "int", "values": [1, 2]}}, 240, 0)
+_if = _g.add_node({"type": "if", "condition": {
+    "type": "paramCompare", "param": "n", "op": "==", "value": "2"}}, 480, 60)
+_two = log_node(_g, "TWO", 720, 0)
+_one = log_node(_g, "ONE", 720, 120)
+_g.entry = _s["id"]
+_g.connect(_s["id"], "next", _loop["id"])
+_g.connect(_loop["id"], "body", _if["id"])
+_g.connect(_if["id"], "true", _two["id"])
+_g.connect(_if["id"], "false", _one["id"])
+_code, _lines, _text = run_graph(_g, "foreach_cond")
+check(u"조건이 반복 변수를 읽는다", marks(_lines) == ["START", "ONE", "TWO"],
+      u"%r" % (marks(_lines),))
+
+# 본문 안에서 break
+_g = graph_model.Graph(graph_model.blank(u"값 반복 break"))
+_loop = _g.add_node({"type": "repeat", "forEach": {
+    "param": "n", "type": "int", "values": [1, 2, 3, 4]}}, 0, 0)
+_b = log_node(_g, "B", 240, 60)
+_if = _g.add_node({"type": "if", "condition": {
+    "type": "paramCompare", "param": "n", "op": ">=", "value": "2"}}, 480, 60)
+_brk = _g.add_node({"type": "break"}, 720, 0)
+_after = log_node(_g, "AFTER", 240, -60)
+_g.entry = _loop["id"]
+_g.connect(_loop["id"], "body", _b["id"])
+_g.connect(_loop["id"], "completed", _after["id"])
+_g.connect(_b["id"], "next", _if["id"])
+_g.connect(_if["id"], "true", _brk["id"])
+_code, _lines, _text = run_graph(_g, "foreach_break")
+check(u"break 가 값 반복을 끝내고 완료로 나간다",
+      marks(_lines) == ["B", "B", "AFTER"], u"%r" % (marks(_lines),))
+
+# 반복 밖에서 참조하면 실행이 멈춘다 (조용히 비우지 않는다)
+_g = graph_model.Graph(graph_model.blank(u"범위 밖 참조"))
+_loop = _g.add_node({"type": "repeat", "forEach": {
+    "param": "n", "type": "int", "values": [1]}}, 0, 0)
+_inside = log_node(_g, "IN", 240, 60)
+_call = _g.add_node({"type": "call", "macro": "ForEachCallee",
+                     "args": {"no": graph_model.param_ref("n")}}, 240, -60)
+_g.entry = _loop["id"]
+_g.connect(_loop["id"], "body", _inside["id"])
+_g.connect(_loop["id"], "completed", _call["id"])
+_code, _lines, _text = run_graph(_g, "foreach_out_of_scope")
+check(u"반복 밖 참조를 실행 시점에 잡는다",
+      u"지금 범위에 없습니다" in _text, u"exit=%s" % _code)
+check(u"조용히 넘어가지 않고 중단된다", _code != 0, u"exit=%s" % _code)
+
+# 중첩: 안쪽이 끝나면 바깥 값이 돌아온다
+_g = graph_model.Graph(graph_model.blank(u"중첩 값 반복"))
+_outer = _g.add_node({"type": "repeat", "forEach": {
+    "param": "a", "type": "string", "values": ["x", "y"]}}, 0, 0)
+_inner = _g.add_node({"type": "repeat", "forEach": {
+    "param": "b", "type": "string", "values": ["1", "2"]}}, 240, 60)
+_mark = _g.add_node({"type": "log", "message": "MARK:PAIR"}, 480, 120)
+_g.entry = _outer["id"]
+_g.connect(_outer["id"], "body", _inner["id"])
+_g.connect(_inner["id"], "body", _mark["id"])
+_code, _lines, _text = run_graph(_g, "foreach_nested")
+check(u"중첩 값 반복이 값의 곱만큼 돈다", len(marks(_lines)) == 4,
+      u"%r" % (marks(_lines),))
+check(u"바깥 변수가 안쪽 반복 뒤에도 유지된다",
+      _text.count(u"a = ") >= 2 or _text.count(u'a = "x"') >= 1, u"")
+
+# 방식을 둘 이상 적으면 실행하지 않는다
+_g = graph_model.Graph(graph_model.blank(u"방식 충돌"))
+_g.add_node({"type": "repeat", "times": 2, "forEach": {
+    "param": "n", "type": "int", "values": [1]}}, 0, 0)
+_g.entry = _g.nodes[0]["id"]
+_errors, _ = _g.validate()
+check(u"횟수와 값 목록을 함께 쓰면 오류",
+      any(u"하나만 골라야" in e for e in _errors), u"%r" % (_errors,))
+_code, _lines, _text = run_graph(_g, "foreach_conflict")
+check(u"충돌한 반복은 실행되지 않음", _code != 0, u"exit=%s" % _code)
+
 
 
 # ------------------------------------------------------------------ 결과

@@ -1576,7 +1576,10 @@ class MacroEditorApp(object):
             target = self.load_macro_data(ref)
             if target is None:
                 continue
-            _values, trouble = graph_model.bind_params(target, node.get("args"))
+            # 반복 변수 참조($이름)는 아직 값이 아니다. 여기서는 이름이
+            # 대상에 선언돼 있는지만 보고, 값 검사는 실행에 맡긴다.
+            _values, trouble = graph_model.bind_params(
+                target, node.get("args"), allow_refs=True)
             for line in trouble:
                 problems.append(u"노드 %s (%s): %s"
                                 % (node.get("id"), ref, line))
@@ -2040,13 +2043,17 @@ class MacroEditorApp(object):
         조용히 이겨서, 조건을 넣어 둔 반복이 조건을 보지도 않고 끝났다.
         조건을 고르는 순간 횟수를 치운다.
         """
-        dropped = "times" in step
+        dropped = [label for key, label in (("times", u"반복 횟수"),
+                                            ("forEach", u"값 목록"))
+                   if key in step]
         step.pop("times", None)
+        step.pop("forEach", None)
         if "maxIterations" not in step:
             # 조건 반복에는 필수다. 비워 두면 검사에서 막혀 진행이 끊긴다.
             step["maxIterations"] = 100
         if dropped:
-            self.status.set(u"조건 반복으로 바꿨습니다 - '반복 횟수'를 비웠습니다")
+            self.status.set(u"조건 반복으로 바꿨습니다 - '%s'을 비웠습니다"
+                            % u"', '".join(dropped))
         # 지금은 조건 위젯의 콜백 안이다. 여기서 패널을 다시 만들면 호출 중인
         # 위젯이 사라진다. 콜백이 끝난 뒤로 미룬다.
         self.root.after_idle(self.build_properties)
@@ -2175,7 +2182,8 @@ class MacroEditorApp(object):
         elif ftype == "param_name":
             # 이 매크로가 선언한 매개변수만 고를 수 있다. 직접 타이핑하게 두면
             # 이름을 바꿨을 때 조건이 조용히 어긋난다.
-            names = graph_model.param_names(self.macro.data)
+            # 선언된 매개변수 + forEach 반복이 만드는 변수
+            names = graph_model.scope_param_names(self.macro.data)
             combo = ttk.Combobox(row, values=names, state="readonly", width=22)
             current = target.get(name)
             if current in names:
@@ -2193,6 +2201,9 @@ class MacroEditorApp(object):
             if not names:
                 ttk.Label(row, text=u"(선언된 매개변수 없음)",
                           style="Dim.TLabel").pack(side="left", padx=(6, 0))
+
+        elif ftype == "foreach":
+            self._build_foreach(parent, row, target, changed)
 
         elif ftype == "call_args":
             self._build_call_args(parent, row, target, changed)
@@ -2236,11 +2247,16 @@ class MacroEditorApp(object):
                 target[name] = value
                 if (not same and name == "times"
                         and target.get("type") == "repeat"
-                        and "while" in target):
+                        and ("while" in target or "forEach" in target)):
+                    gone = [label for key, label in (("while", u"조건"),
+                                                     ("forEach", u"값 목록"))
+                            if key in target]
                     target.pop("while", None)
                     target.pop("maxIterations", None)
+                    target.pop("forEach", None)
                     self.status.set(
-                        u"횟수 반복으로 바꿨습니다 - '조건'을 비웠습니다")
+                        u"횟수 반복으로 바꿨습니다 - '%s'을 비웠습니다"
+                        % u"', '".join(gone))
                     self.root.after_idle(self.build_properties)
                 changed()
             watched = self._watch_field(lambda: var.get(), commit)
@@ -2266,6 +2282,96 @@ class MacroEditorApp(object):
                 return json.loads(handle.read())
         except Exception:
             return None
+
+    def _build_foreach(self, parent, row, node, changed):
+        """값 목록으로 도는 반복을 편집한다.
+
+        변수 이름 / 타입 / 값 목록 세 칸이다. 이름을 비우면 forEach 자체를
+        지워서 다시 횟수 반복으로 돌아간다 - 빈 껍데기가 남으면 검사에서
+        '값이 하나 이상 필요합니다' 로만 보여 원인을 알기 어렵다.
+        """
+        ttk.Label(row, text=u"").pack(side="left")     # 라벨 줄만 차지한다
+        box = ttk.Frame(parent)
+        box.pack(fill="x", padx=(96, 0))
+
+        spec = node.get("forEach")
+        if not isinstance(spec, dict):
+            spec = {}
+
+        name_var = tk.StringVar(value=spec.get("param") or "")
+        type_var = tk.StringVar(value=spec.get("type") or "int")
+        values_var = tk.StringVar(
+            value=", ".join(u"%s" % v for v in (spec.get("values") or [])))
+
+        def commit(_e=None):
+            name = name_var.get().strip()
+            if not name:
+                if "forEach" in node:
+                    node.pop("forEach", None)
+                    changed()
+                return
+            ptype = type_var.get()
+            raw = [t.strip() for t in values_var.get().split(",")]
+            raw = [t for t in raw if t != ""]
+            if not raw:
+                self.status.set(u"값을 하나 이상 적으세요 (쉼표로 구분)")
+                return
+            values = []
+            for index, text in enumerate(raw):
+                try:
+                    values.append(graph_model.coerce_param(
+                        text, ptype, u"%d번째 값" % (index + 1)))
+                except graph_model.ParamError as exc:
+                    self.status.set(u"%s" % exc)
+                    return
+            if name in graph_model.param_names(self.macro.data):
+                self.status.set(
+                    u"'%s' 는 선언된 매개변수와 이름이 같습니다. 다른 이름을 쓰세요"
+                    % name)
+                return
+            # 값 반복은 횟수/조건과 함께 쓸 수 없다. 고른 쪽만 남긴다.
+            gone = [label for key, label in (("times", u"반복 횟수"),
+                                             ("while", u"조건"))
+                    if key in node]
+            for key in ("times", "while", "maxIterations", "allowMaxIterations"):
+                node.pop(key, None)
+            node["forEach"] = {"param": name, "type": ptype, "values": values}
+            if gone:
+                self.status.set(u"값 목록 반복으로 바꿨습니다 - '%s'을 비웠습니다"
+                                % u"', '".join(gone))
+            changed()
+
+        line = ttk.Frame(box)
+        line.pack(fill="x", pady=2)
+        ttk.Label(line, text=u"변수 이름", width=12).pack(side="left")
+        name_entry = ttk.Entry(line, textvariable=name_var, width=18)
+        name_entry.pack(side="left")
+        ttk.Label(line, text=u"타입", width=6).pack(side="left", padx=(8, 0))
+        type_combo = ttk.Combobox(line, textvariable=type_var, width=8,
+                                  state="readonly",
+                                  values=list(graph_model.PARAM_TYPES))
+        type_combo.pack(side="left")
+
+        line2 = ttk.Frame(box)
+        line2.pack(fill="x", pady=2)
+        ttk.Label(line2, text=u"값 목록", width=12).pack(side="left")
+        values_entry = ttk.Entry(line2, textvariable=values_var)
+        values_entry.pack(side="left", fill="x", expand=True)
+
+        ttk.Label(box, text=u"쉼표로 구분합니다. 예: 2, 3, 4, 5, 6",
+                  style="Dim.TLabel").pack(anchor="w", padx=(96, 0))
+        if name_var.get():
+            ttk.Label(box,
+                      text=u"호출 노드의 '넘길 값'에 $%s 라고 적으면 전달됩니다"
+                           % name_var.get(),
+                      style="Dim.TLabel").pack(anchor="w", padx=(96, 0))
+
+        for entry in (name_entry, values_entry):
+            watched = self._watch_field(
+                lambda nv=name_var, vv=values_var: (nv.get(), vv.get()), commit)
+            entry.bind("<FocusOut>", watched)
+            entry.bind("<Return>", watched)
+        type_combo.bind("<<ComboboxSelected>>", commit)
 
     def _build_call_args(self, parent, row, node, changed):
         """호출 노드가 넘길 값을 편집한다.
@@ -2298,6 +2404,8 @@ class MacroEditorApp(object):
                 ptype, ptype))
             if "default" in param:
                 label += u" 기본 %s" % (param["default"],)
+            if graph_model.loop_params(self.macro.data):
+                label += u"  ($이름 으로 반복 변수)"
             line = ttk.Frame(box)
             line.pack(fill="x", pady=2)
             ttk.Label(line, text=label, width=26).pack(side="left")
@@ -2309,6 +2417,19 @@ class MacroEditorApp(object):
                 text = var.get().strip()
                 if text == "":
                     args.pop(pname, None)
+                    changed()
+                    return
+                if text.startswith("$"):
+                    # 반복 변수를 그대로 넘긴다. 값이 아니라 이름이므로
+                    # 여기서 타입 변환을 하지 않는다 - 실행 시점에 맞춘다.
+                    ref = text[1:].strip()
+                    known = graph_model.scope_param_names(self.macro.data)
+                    if ref not in known:
+                        self.status.set(
+                            u"'%s' 는 이 매크로에 없는 이름입니다 (쓸 수 있는 것: %s)"
+                            % (ref, u", ".join(known) or u"없음"))
+                        return
+                    args[pname] = graph_model.param_ref(ref)
                     changed()
                     return
                 try:
@@ -2412,6 +2533,8 @@ class MacroEditorApp(object):
     def _value_to_text(value):
         if value is None:
             return ""
+        if graph_model.is_param_ref(value):
+            return "$%s" % value.get(graph_model.PARAM_REF)
         if isinstance(value, (list, tuple)):
             if value and all(isinstance(v, (list, tuple)) for v in value):
                 # 좌표가 여러 개다. 점 안은 쉼표, 점끼리는 세미콜론으로 끊는다.

@@ -80,6 +80,115 @@ def param_names(macro):
     return [p.get("name") for p in declared_params(macro) if p.get("name")]
 
 
+# 반복이 값 목록을 하나씩 넣어 주는 변수. call 의 인자에서 PARAM_REF 로 읽는다.
+# 선언된 매개변수(params)와 달리 반복 본문 안에서만 살아 있다.
+PARAM_REF = "$param"
+
+
+def is_param_ref(value):
+    """{"$param": "이름"} 형태인가."""
+    return isinstance(value, dict) and list(value.keys()) == [PARAM_REF]
+
+
+def param_ref(name):
+    return {PARAM_REF: name}
+
+
+def foreach_spec(node):
+    """repeat 노드의 forEach 설정. 없으면 None."""
+    if not isinstance(node, dict) or node.get("type") != "repeat":
+        return None
+    spec = node.get("forEach")
+    return spec if isinstance(spec, dict) else None
+
+
+def loop_params(macro):
+    """forEach 반복이 만드는 변수 -> 타입. 이름이 겹치면 먼저 나온 것을 쓴다.
+
+    선언된 매개변수와 달리 매크로 단위가 아니라 노드에 붙어 있어서,
+    조건 검증과 편집기 목록을 위해 여기서 모아 준다.
+    """
+    found = {}
+    nodes = macro.get("nodes") if isinstance(macro, dict) else None
+    for node in nodes or []:
+        spec = foreach_spec(node)
+        if not spec:
+            continue
+        name = spec.get("param")
+        if name and name not in found:
+            found[name] = spec.get("type")
+    return found
+
+
+def scope_param_names(macro):
+    """이 매크로 안에서 이름으로 참조할 수 있는 값 전부 (선언 + 반복 변수)."""
+    names = list(param_names(macro))
+    for name in sorted(loop_params(macro).keys()):
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def validate_foreach(node):
+    """forEach 설정 자체를 검사한다. 오류 목록을 반환."""
+    spec = foreach_spec(node)
+    if spec is None:
+        return []
+    where = u"노드 %s의 값 반복" % node.get("id")
+    problems = []
+    name = spec.get("param")
+    if not name or not isinstance(name, _TEXT_TYPES):
+        problems.append(u"%s: 변수 이름이 필요합니다" % where)
+    ptype = spec.get("type")
+    if ptype not in PARAM_TYPES:
+        problems.append(u"%s: 타입은 %s 중 하나여야 합니다 (지금 %r)"
+                        % (where, u"/".join(PARAM_TYPES), ptype))
+        return problems
+    values = spec.get("values")
+    if not isinstance(values, list) or not values:
+        problems.append(u"%s: 값이 하나 이상 필요합니다" % where)
+        return problems
+    for index, raw in enumerate(values):
+        try:
+            coerce_param(raw, ptype, u"%s %d번째 값" % (where, index + 1))
+        except ParamError as exc:
+            problems.append(u"%s" % exc)
+    return problems
+
+
+def foreach_values(spec, where=u"값 반복"):
+    """forEach 의 값 목록을 선언된 타입으로 바꿔서 돌려준다."""
+    ptype = spec.get("type")
+    return [coerce_param(raw, ptype, u"%s %d번째 값" % (where, i + 1))
+            for i, raw in enumerate(spec.get("values") or [])]
+
+
+def resolve_args(args, scope):
+    """call 의 인자에서 {"$param": 이름} 을 실제 값으로 바꾼다.
+
+    (값 dict, 문제목록) 을 반환한다. 이름이 범위에 없으면 문제로 남긴다 -
+    조용히 비워 두면 반복 밖에서 쓴 참조가 말없이 어긋난다.
+    """
+    args = args if isinstance(args, dict) else {}
+    scope = scope if isinstance(scope, dict) else {}
+    out = {}
+    problems = []
+    for key in sorted(args.keys()):
+        value = args[key]
+        if not is_param_ref(value):
+            out[key] = value
+            continue
+        name = value.get(PARAM_REF)
+        if name in scope:
+            out[key] = scope[name]
+        else:
+            problems.append(
+                u"넘길 값 '%s': 참조한 '%s' 가 지금 범위에 없습니다 "
+                u"(반복 본문 밖에서 반복 변수를 쓰지 않았는지 확인하세요)"
+                % (key, name))
+    return out, problems
+
+
 def coerce_param(value, ptype, where=u"매개변수"):
     """값을 선언된 타입으로 바꾼다. 못 바꾸면 ParamError.
 
@@ -151,12 +260,17 @@ def validate_params(macro):
     return problems
 
 
-def bind_params(macro, args):
+def bind_params(macro, args, allow_refs=False):
     """선언과 전달값을 맞춰 실제로 쓸 값 dict 를 만든다.
 
     (값, 문제목록) 을 반환한다. 문제가 있으면 호출하는 쪽이 멈춘다.
     선언에 없는 값을 넘기면 오류다 - 이름을 바꿨을 때 조용히 무시되면
     매크로가 왜 안 먹는지 찾을 수 없기 때문이다.
+
+    allow_refs=True 는 **실행 전 검사**용이다. {"$param": 이름} 은 아직 값이
+    아니라 이름이므로 타입 변환을 하지 않고 통과시킨다. 실행 시점에는
+    resolve_args 가 이미 값으로 바꿔 놓으므로 기본값(False)을 그대로 쓴다 -
+    그래야 풀리지 않은 참조가 흘러들어온 것을 엔진이 잡아낸다.
     """
     args = args if isinstance(args, dict) else {}
     declared = declared_params(macro)
@@ -173,6 +287,15 @@ def bind_params(macro, args):
         where = u"매개변수 '%s'" % name
         if name in args:
             raw = args[name]
+            if is_param_ref(raw):
+                if allow_refs:
+                    # 값은 실행할 때 정해진다. 여기서는 이름이 대상 매크로에
+                    # 선언돼 있는지만 본 셈이다.
+                    values[name] = raw
+                    continue
+                problems.append(
+                    u"%s: 참조 %s 가 값으로 바뀌지 않았습니다" % (where, raw))
+                continue
         elif "default" in param:
             raw = param["default"]
         else:
@@ -584,26 +707,38 @@ class Graph(object):
 
         for node in self.nodes:
             if node.get("type") == "repeat":
-                if "times" not in node and "while" not in node:
-                    errors.append(u"노드 %s: 반복 횟수(times) 또는 조건(while)이 필요합니다"
-                                  % node.get("id"))
-                if "times" in node and "while" in node:
-                    # 실행기는 이 조합을 거부한다. 예전에는 times 가 조용히
-                    # 이겨서, 조건 반복이 조건을 보지도 않고 끝났다.
+                # 반복 방식은 셋 중 하나뿐이다. 둘 이상 적혀 있으면 어느 쪽이
+                # 뜻인지 알 수 없다 - 예전에 times 가 조용히 이겨서 조건 반복이
+                # 조건을 보지도 않고 끝난 적이 있다. 짐작하지 않는다.
+                modes = [key for key in ("times", "while", "forEach")
+                         if key in node]
+                if not modes:
                     errors.append(
-                        u"노드 %s: 반복 횟수(times)와 조건(while)을 함께 쓸 수 "
-                        u"없습니다. 조건으로 반복하려면 횟수 칸을 비우세요"
-                        % node.get("id"))
+                        u"노드 %s: 반복 횟수(times) / 조건(while) / "
+                        u"값 목록(forEach) 중 하나가 필요합니다" % node.get("id"))
+                if len(modes) > 1:
+                    errors.append(
+                        u"노드 %s: 반복 방식을 하나만 골라야 합니다 "
+                        u"(지금 %s 가 함께 있습니다)"
+                        % (node.get("id"), u", ".join(modes)))
                 if "while" in node and "maxIterations" not in node:
                     errors.append(u"노드 %s: 조건 반복에는 maxIterations가 필수입니다"
                                   % node.get("id"))
+                errors.extend(validate_foreach(node))
+                spec = foreach_spec(node)
+                if spec and spec.get("param") in set(param_names(self.data)):
+                    # 같은 이름이면 반복이 도는 동안 선언된 매개변수가 가려진다.
+                    errors.append(
+                        u"노드 %s: 반복 변수 '%s' 가 선언된 매개변수와 이름이 "
+                        u"같습니다. 다른 이름을 쓰세요"
+                        % (node.get("id"), spec.get("param")))
             if node.get("type") == "if" and not node.get("condition"):
                 errors.append(u"노드 %s: 조건이 없습니다" % node.get("id"))
 
         errors.extend(validate_params(self.data))
         # 조건이 참조하는 매개변수가 이 매크로에 선언돼 있는지.
         # 이름을 바꿨을 때 조건이 조용히 어긋나는 것을 막는다.
-        known = set(param_names(self.data))
+        known = set(scope_param_names(self.data))
         for node in self.nodes:
             for cond in _all_conditions(node):
                 if cond.get("type") != "paramCompare":
@@ -619,6 +754,23 @@ class Graph(object):
                 if cond.get("op") not in PARAM_OPS:
                     errors.append(u"%s: 비교 방법이 잘못됐습니다 (%r)"
                                   % (where, cond.get("op")))
+
+        # 호출 인자가 참조하는 이름이 이 매크로에 있는지. 범위(반복 본문 안인지)
+        # 까지는 실행 시점에 resolve_args 가 잡는다.
+        for node in self.nodes:
+            if node.get("type") != "call":
+                continue
+            args = node.get("args")
+            if not isinstance(args, dict):
+                continue
+            for key in sorted(args.keys()):
+                if not is_param_ref(args[key]):
+                    continue
+                name = args[key].get(PARAM_REF)
+                if name not in known:
+                    errors.append(
+                        u"노드 %s: 넘길 값 '%s' 가 참조한 '%s' 는 이 매크로에 "
+                        u"없는 이름입니다" % (node.get("id"), key, name))
 
         return errors, warnings
 

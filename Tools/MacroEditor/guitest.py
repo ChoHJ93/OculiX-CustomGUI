@@ -530,6 +530,40 @@ check(u"대상에 없는 값을 넘기면 잡는다",
       any(u"wrongName" in p for p in app.check_call_targets()),
       u"%r" % (app.check_call_targets(),))
 
+# 반복 변수 참조는 아직 '값'이 아니다. 실행 전 검사가 타입 변환을 시도하면
+# 정상 매크로가 정의 오류로 막힌다 - 실제로 그렇게 막혔던 자리다.
+_loop = app.canvas_view.add_node("repeat", 0, 200)
+_loop.pop("times", None)
+_loop["forEach"] = {"param": "charNo", "type": "int", "values": [2, 3]}
+app.graph.connect(_loop["id"], "body", _call["id"])
+_call["args"] = {"who": graph_model.param_ref("charNo")}
+check(u"반복 변수 참조를 넘겨도 실행 전 검사를 통과",
+      not app.check_call_targets(), u"%r" % (app.check_call_targets(),))
+check(u"참조를 넘긴 그래프에 정의 오류가 없다",
+      not app.graph.validate()[0], u"%r" % (app.graph.validate()[0],))
+
+_call["args"] = {"없는이름": graph_model.param_ref("charNo")}
+check(u"참조라도 대상에 없는 이름이면 잡는다",
+      any(u"없는이름" in p for p in app.check_call_targets()),
+      u"%r" % (app.check_call_targets(),))
+
+_call["args"] = {"who": graph_model.param_ref("타이포")}
+check(u"이 매크로에 없는 이름을 참조하면 검사가 잡는다",
+      any(u"타이포" in e for e in app.graph.validate()[0]),
+      u"%r" % (app.graph.validate()[0],))
+
+# 실행 시점에는 풀리지 않은 참조를 통과시키면 안 된다 (방어선)
+_decl_ref = {"params": [{"name": "n", "type": "int"}]}
+_v, _bad = graph_model.bind_params(
+    _decl_ref, {"n": graph_model.param_ref("charNo")})
+check(u"풀리지 않은 참조는 실행 시점 결합에서 막힌다",
+      any(u"값으로 바뀌지 않았습니다" in b for b in _bad), u"%r" % (_bad,))
+
+app.graph.remove_node(_loop["id"])      # 뒤 검사들이 쓰던 상태로 되돌린다
+_call["args"] = {"who": "abc"}
+check(u"반복 노드를 치우면 원래대로 통과", not app.check_call_targets(),
+      u"%r" % (app.check_call_targets(),))
+
 # 대상 매크로 선언을 읽어 칸을 만든다
 _call["args"] = {"who": "abc"}
 app.on_node_selected(_call["id"])
@@ -2025,7 +2059,65 @@ _cg.add_node({"type": "repeat", "times": 0,
               "maxIterations": 10}, 0, 0)
 _ce, _cw = _cg.validate()
 check(u"검사가 횟수+조건 충돌을 잡는다",
-      any(u"함께 쓸 수 없" in e for e in _ce), u"%r" % (_ce,))
+      any(u"하나만 골라야" in e for e in _ce), u"%r" % (_ce,))
+
+section(u"값 목록 반복 (forEach)")
+
+# 값이 채워진 상태로 폼을 그린다. 빈 상태는 '모든 단계 종류'가 이미 본다 -
+# 여기서 보는 건 저장된 값을 다시 열었을 때 위젯이 죽지 않는가다.
+app.macro = model.Macro(graph_model.blank(u"값 반복 폼"))
+app.current_path = None
+app.apply_mode()
+_fe = app.canvas_view.add_node("repeat")
+_fe.pop("times", None)
+_fe["forEach"] = {"param": "charNo", "type": "int", "values": [2, 3, 4]}
+app.on_node_selected(_fe["id"])
+try:
+    app.build_properties()
+    root.update_idletasks()
+    check(u"값 반복 속성 폼이 만들어진다",
+          len(app.prop_frame.winfo_children()) > 0)
+except Exception as _exc:
+    check(u"값 반복 속성 폼이 만들어진다", False,
+          u"%s: %s" % (type(_exc).__name__, _exc))
+
+_texts = []
+for _w in _walk_widgets(app.prop_frame):
+    if isinstance(_w, ttk_module.Label):
+        try:
+            _texts.append(_w.cget("text"))
+        except Exception:
+            pass
+check(u"폼에 변수 이름 칸이 있다", any(u"변수 이름" in t for t in _texts),
+      u"%r" % (_texts[-6:],))
+check(u"$이름 사용법을 안내한다",
+      any(u"$charNo" in t for t in _texts), u"%r" % (_texts[-6:],))
+
+# 반복 변수는 조건의 매개변수 목록에도 나와야 한다
+check(u"조건 목록에 반복 변수가 보인다",
+      "charNo" in graph_model.scope_param_names(app.macro.data),
+      u"%r" % (graph_model.scope_param_names(app.macro.data),))
+
+# 방식 전환: 값 목록이 있는데 조건을 넣으면 값 목록이 빠진다
+_sw = schema.new_step("repeat")
+_sw.pop("times", None)
+_sw["forEach"] = {"param": "n", "type": "int", "values": [1, 2]}
+app._set_step_value(_sw, "while", {"type": "imageMissing", "image": "a.png"})
+check(u"조건을 넣으면 값 목록이 빠진다", "forEach" not in _sw, u"%r" % (_sw,))
+
+# 실행기와 검사기가 같은 규칙을 지킨다
+_cg2 = graph_model.Graph(graph_model.blank(u"값+횟수 충돌"))
+_cg2.add_node({"type": "repeat", "times": 2,
+               "forEach": {"param": "n", "type": "int", "values": [1]}}, 0, 0)
+_ce2, _cw2 = _cg2.validate()
+check(u"검사가 횟수+값목록 충돌을 잡는다",
+      any(u"하나만 골라야" in e for e in _ce2), u"%r" % (_ce2,))
+
+# 참조를 되읽으면 $이름 으로 보인다
+check(u"참조가 $이름 으로 표시된다",
+      app._value_to_text(graph_model.param_ref("charNo")) == "$charNo",
+      u"%r" % (app._value_to_text(graph_model.param_ref("charNo")),))
+
 
 section(u"노드 복사 / 붙여넣기")
 

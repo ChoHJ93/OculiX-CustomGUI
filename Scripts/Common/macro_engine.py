@@ -638,7 +638,8 @@ class Engine(object):
         for param in graph_model.declared_params(self.macro):
             if param.get("name") == name:
                 return param.get("type")
-        return None
+        # 반복(forEach)이 만드는 변수는 선언 목록에 없다. 노드에서 찾는다.
+        return graph_model.loop_params(self.macro).get(name)
 
     def _compare_param(self, cond):
         """선언된 매개변수를 리터럴과 비교한다.
@@ -1267,9 +1268,19 @@ class GraphEngine(Engine):
         def sub_logger(message):
             self.log(u"%s| %s" % (indent, message))
 
+        # 반복 변수를 넘기는 {"$param": 이름} 을 지금 값으로 바꾼다.
+        # 범위에 없으면 여기서 멈춘다 - 비워서 넘기면 왜 안 먹는지 찾을 수 없다.
+        supplied, trouble = graph_model.resolve_args(node.get("args"),
+                                                     self.params)
+        if trouble:
+            for line in trouble:
+                self.log(u"    매개변수 오류: %s" % line)
+            stack.pop()
+            return self._call_failed(node)
+
         # 넘길 값을 선언과 맞춰 본다. 어긋나면 실행하지 않는다 -
         # 조용히 넘어가면 왜 안 먹는지 찾을 수 없다.
-        bound, trouble = graph_model.bind_params(data, node.get("args"))
+        bound, trouble = graph_model.bind_params(data, supplied)
         if trouble:
             for line in trouble:
                 self.log(u"    매개변수 오류: %s" % line)
@@ -1306,13 +1317,19 @@ class GraphEngine(Engine):
     def _run_loop(self, node, depth):
         body_start = self.graph.target(node.get("id"), "body")
 
-        # 둘 다 있으면 어느 쪽이 뜻인지 알 수 없다. 예전에는 times 가 조용히
-        # 이겨서, 조건을 넣어 둔 반복이 조건을 한 번도 보지 않고 끝났다
-        # (times=0 이면 본문 없이 곧장 '완료' 핀으로 나간다). 짐작하지 않는다.
-        if "times" in node and "while" in node:
+        # 반복 방식은 times / while / forEach 셋 중 하나뿐이다. 둘 이상 있으면
+        # 어느 쪽이 뜻인지 알 수 없다. 예전에는 times 가 조용히 이겨서, 조건을
+        # 넣어 둔 반복이 조건을 한 번도 보지 않고 끝났다 (times=0 이면 본문 없이
+        # 곧장 '완료' 핀으로 나간다). 짐작하지 않는다.
+        modes = [key for key in ("times", "while", "forEach") if key in node]
+        if len(modes) > 1:
             raise MacroError(
-                u"노드 %s: 반복 횟수(times)와 조건(while)을 함께 쓸 수 없습니다. "
-                u"조건으로 반복하려면 횟수 칸을 비우세요" % node.get("id"))
+                u"노드 %s: 반복 방식을 하나만 골라야 합니다 (지금 %s 가 함께 "
+                u"있습니다)" % (node.get("id"), u", ".join(modes)))
+
+        spec = graph_model.foreach_spec(node)
+        if spec is not None:
+            return self._run_foreach(node, spec, body_start, depth)
 
         if "times" in node:
             count = int(node["times"])
@@ -1355,7 +1372,49 @@ class GraphEngine(Engine):
             self.log(u"    최대 반복 도달 (%d)" % limit)
             return NORMAL
 
-        raise MacroError(u"노드 %s: times 또는 while이 필요합니다" % node.get("id"))
+        raise MacroError(u"노드 %s: times / while / forEach 중 하나가 필요합니다"
+                         % node.get("id"))
+
+    def _run_foreach(self, node, spec, body_start, depth):
+        """값 목록을 하나씩 변수에 넣으며 본문을 돈다.
+
+        반복 변수는 **본문 안에서만** 산다. 끝나면 이전 값으로 되돌려서,
+        루프 밖에서 남은 값을 실수로 읽는 일이 없게 한다. 같은 이름의 반복이
+        중첩돼도 안쪽이 끝나면 바깥 값이 그대로 돌아온다.
+        """
+        problems = graph_model.validate_foreach(node)
+        if problems:
+            raise MacroError(problems[0])
+
+        name = spec.get("param")
+        values = graph_model.foreach_values(
+            spec, u"노드 %s의 값 반복" % node.get("id"))
+        if len(values) > HARD_ITERATION_CAP:
+            raise MacroError(u"반복할 값이 %d개로 상한 %d를 넘습니다"
+                             % (len(values), HARD_ITERATION_CAP))
+
+        self._log_entry(node, u" (%s = %s)" % (
+            name, u", ".join(self._param_text(v) for v in values)))
+
+        had = name in self.params
+        previous = self.params.get(name)
+        try:
+            for index, value in enumerate(values):
+                self.params[name] = value
+                self.log(u"    %d/%d  %s = %s" % (
+                    index + 1, len(values), name, self._param_text(value)))
+                status = self._run_chain(body_start, depth + 1)
+                if status == ABORT:
+                    return ABORT
+                if status == BREAK:
+                    self.log(u"    break")
+                    return NORMAL
+        finally:
+            if had:
+                self.params[name] = previous
+            else:
+                self.params.pop(name, None)
+        return NORMAL
 
 
 

@@ -245,6 +245,9 @@ STEP_TYPES = OrderedDict([
              "help": u"횟수 대신 조건으로 반복할 때"},
             {"name": "maxIterations", "type": "int", "label": u"최대 반복",
              "help": u"조건 반복에는 필수. 무한 루프를 형식 차원에서 막는다"},
+            {"name": "forEach", "type": "foreach", "label": u"값 목록으로 반복",
+             "help": u"값을 하나씩 변수에 넣으며 반복한다. 그 변수는 호출 노드의 "
+                     u"'넘길 값'에서 $이름 으로 쓴다. 횟수/조건과 함께 쓸 수 없다"},
             {"name": "allowMaxIterations", "type": "bool",
              "label": u"최대 도달을 성공으로 취급", "default": True},
         ],
@@ -531,6 +534,14 @@ def summarize(step):
         elif "while" in step:
             detail = u"while %s (최대 %s)" % (
                 describe_condition(step.get("while")), step.get("maxIterations"))
+        elif isinstance(step.get("forEach"), dict):
+            spec = step["forEach"]
+            values = spec.get("values") or []
+            shown = u", ".join(u"%s" % v for v in values[:6])
+            if len(values) > 6:
+                shown += u", ..."
+            detail = u"%s = %s (%d회)" % (spec.get("param") or u"?",
+                                          shown, len(values))
     elif stype == "call":
         detail = step.get("macro") or u"(매크로 미지정)"
     elif stype == "run":
