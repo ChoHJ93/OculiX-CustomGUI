@@ -37,6 +37,10 @@ MACROS_DIR = os.path.join(PROJECT, "Macros")
 CAPTURE_SETTLE_SEC = 0.35
 sys.path.insert(0, os.path.join(PROJECT, "Scripts", "Common"))
 
+# find_macro_callers 가 감시 목록(handlers)의 참조를 돌려줄 때 노드 id 대신
+# 쓰는 자리 표시. 노드 id 는 "n1" 꼴이라 겹치지 않는다.
+_HANDLER_SLOT = u"감시목록[%d]"
+
 
 def _crash_log(text):
     """시작 중 죽었을 때 흔적을 남긴다.
@@ -79,6 +83,7 @@ def _crash_report(stage):
 try:
     import docking
     import graph_model
+    import hotkey
     import imagecache
     import imagepicker
     import keypicker
@@ -88,6 +93,7 @@ try:
     import pickers
     import project_panel
     import runner
+    import runlog
     import schema
     import screenutil
     import settings
@@ -95,6 +101,19 @@ try:
 except Exception:
     _crash_log(_crash_report(u"편집기 import 실패"))
     raise
+
+
+PAUSE_LABEL = u"⏸ 일시정지 (F6)"
+RESUME_LABEL = u"▶ 재개 (F6)"
+
+
+def _beep(frequency):
+    """짧은 소리. 소리를 못 내도 실행에는 영향이 없어야 한다."""
+    try:
+        import winsound
+        winsound.Beep(frequency, 120)
+    except Exception:
+        pass
 
 
 # ============================================================ 조건 편집기
@@ -229,8 +248,16 @@ class ConditionEditor(ttk.Frame):
         result = {"ok": False}
 
         def confirm():
+            # 먼저 사본을 뜬다. 종류를 바꾸지 않으면 set_cond 가 불리지 않아
+            # holder["cond"] 가 cond 와 **같은 객체**로 남는다. 그 상태에서
+            # cond.clear() 를 하면 원본까지 비워져 빈 조건 {} 이 되고,
+            # type 이 없으니 'AND/OR 조건들' 목록에 'None' 으로 뜨면서
+            # 실행하면 'unknown condition type: None' 으로 죽는다.
+            # 종류를 바꾸면 새 dict 가 들어와서 멀쩡했던 탓에, 기본값
+            # (이미지가 있으면) 그대로 추가할 때만 터졌다.
+            picked = dict(holder["cond"])
             cond.clear()
-            cond.update(holder["cond"])
+            cond.update(picked)
             result["ok"] = True
             dialog.destroy()
 
@@ -256,6 +283,7 @@ class MacroEditorApp(object):
         self.current_path = None
         self.current_step_obj = None      # 속성 패널이 편집 중인 dict
         self.job = None
+        self.runlog = None                # 실행 중일 때만 열려 있는 로그 파일
         self.log_queue = queue.Queue()
 
         # 속성 패널에서 아직 반영되지 않았을 수 있는 입력칸들.
@@ -275,6 +303,10 @@ class MacroEditorApp(object):
         self.tree_view = None
         self.tree = None
         self.prop_frame = None
+        self.resume_button = None
+        self.pause_button = None
+        self.paused = False               # 일시정지를 요청한 상태
+        self.pause_hotkey = None          # 실행 중에만 등록한다 (hotkey 참조)
         self.log = None
         self.view_label = None
         self._library_refs = []
@@ -324,6 +356,7 @@ class MacroEditorApp(object):
         theme.style_menu(m_tools)
         m_tools.add_command(label=u"매크로 검사", command=self.validate_macro)
         m_tools.add_command(label=u"매크로 설정...", command=self.edit_settings)
+        m_tools.add_command(label=u"감시 설정...", command=self.edit_watch)
         m_tools.add_separator()
         m_tools.add_command(label=u"그래프로 변환 (트리 형식 → 노드)",
                             command=self.convert_to_graph)
@@ -338,6 +371,8 @@ class MacroEditorApp(object):
                             command=self.verify_coordinates)
         m_tools.add_command(label=u"화면 정보", command=self.show_screen_info)
         m_tools.add_separator()
+        m_tools.add_command(label=u"실행 로그 폴더 열기",
+                            command=self.open_log_folder)
         m_tools.add_checkbutton(
             label=u"실행이 끝나면 Windows 알림",
             variable=self.notify_var, command=self._on_notify_toggle,
@@ -368,6 +403,10 @@ class MacroEditorApp(object):
         self.root.bind("<Control-s>", lambda e: self.save_macro())
         self.root.bind("<F5>", lambda e: self.run_macro())
         self.root.bind("<Shift-F5>", lambda e: self.run_from_selected_node())
+        self.root.bind("<Control-F5>", lambda e: self.resume_macro())
+        # 전역 단축키가 등록돼 있으면 F6 은 여기까지 오지 않는다. 다른 프로그램이
+        # 이 키를 선점해 등록이 실패했을 때 편집기 안에서라도 쓰게 하는 예비다.
+        self.root.bind("<F6>", lambda e: self.toggle_pause())
 
     def _build_toolbar(self):
         bar = ttk.Frame(self.root, padding=(8, 6))
@@ -398,6 +437,15 @@ class MacroEditorApp(object):
         self.stop_button = ttk.Button(bar, text=u"■ 중지", command=self.stop_macro,
                                       state="disabled")
         self.stop_button.pack(side="left", padx=(6, 0))
+        self.pause_button = ttk.Button(bar, text=PAUSE_LABEL,
+                                       command=self.toggle_pause,
+                                       state="disabled")
+        self.pause_button.pack(side="left", padx=(6, 0))
+        # 지난 실행이 실패로 끝났고 지나온 체크포인트가 있을 때만 켜진다.
+        self.resume_button = ttk.Button(bar, text=u"⏭ 이어서 실행 (Ctrl+F5)",
+                                        command=self.resume_macro,
+                                        state="disabled")
+        self.resume_button.pack(side="left", padx=(6, 0))
 
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
         ttk.Button(bar, text=u"⌖ 시작 노드로 이동",
@@ -937,6 +985,12 @@ class MacroEditorApp(object):
                 resolved = graph_model.resolve_macro_ref(node.get("macro"), folder)
                 if resolved and os.path.normcase(os.path.abspath(resolved)) == target:
                     callers.append((other_ref, node.get("id"), path))
+            # 감시 목록도 참조다. 빠뜨리면 이름을 바꾼 감시 매크로가 걸려
+            # 있던 매크로들이 실행 전 검사에서 전부 막힌다.
+            for index, handler in enumerate(graph_model.handler_refs(data)):
+                resolved = graph_model.resolve_macro_ref(handler, folder)
+                if resolved and os.path.normcase(os.path.abspath(resolved)) == target:
+                    callers.append((other_ref, _HANDLER_SLOT % index, path))
         return callers
 
     def rename_macro(self, ref):
@@ -1020,6 +1074,12 @@ class MacroEditorApp(object):
                     if node.get("id") in node_ids and node.get("type") == "call":
                         node["macro"] = new_ref
                         updated += 1
+                handlers = data.get("handlers")
+                if isinstance(handlers, list):
+                    for index in range(len(handlers)):
+                        if (_HANDLER_SLOT % index) in node_ids:
+                            handlers[index] = new_ref
+                            updated += 1
                 out = open(path, "wb")
                 try:
                     out.write(json.dumps(data, ensure_ascii=False,
@@ -1478,6 +1538,12 @@ class MacroEditorApp(object):
                 full = name if os.path.isabs(name) else os.path.join(folder, name)
                 if os.path.normcase(os.path.abspath(full)) == target:
                     users.append((macro_path, step.get("id")))
+            # 감시 조건의 이미지도 사용처다. 빠뜨리면 감시에만 쓰는 이미지가
+            # '아무도 안 쓰는 이미지'로 보여 지워진다.
+            for name in schema.condition_images(data.get("watch")):
+                full = name if os.path.isabs(name) else os.path.join(folder, name)
+                if os.path.normcase(os.path.abspath(full)) == target:
+                    users.append((macro_path, u"감시 조건"))
         return users
 
     def rename_image_references(self, old_name, new_name, old_path):
@@ -1504,6 +1570,11 @@ class MacroEditorApp(object):
                         step["image"] = new_name
                         touched = True
                         changed += 1
+                watch = data.get("watch")
+                if old_name in schema.condition_images(watch):
+                    schema.rewrite_condition_images(watch, {old_name: new_name})
+                    touched = True
+                    changed += 1
                 if touched:
                     out = open(macro_path, "wb")
                     try:
@@ -1585,10 +1656,54 @@ class MacroEditorApp(object):
                                 % (node.get("id"), ref, line))
         return problems
 
+    def check_handler_targets(self):
+        """이 매크로가 건 감시 매크로를 실제 파일과 대조한다. (오류, 경고).
+
+        엔진도 실행 전에 같은 검사로 거부하지만, 실행할 때가 아니라 지금
+        알아야 한다. 트리 형식은 Graph.validate 를 거치지 않으므로 선언
+        검사도 여기서 함께 한다.
+        """
+        warnings = []
+        errors = []
+        if self.mode != "graph":
+            errors.extend(graph_model.validate_handler_decl(self.macro.data,
+                                                            warnings))
+        base = self.macro.folder or MACROS_DIR
+        found, cautions = graph_model.check_handler_refs(
+            self.macro.data, base, self.macro.path)
+        return errors + found, warnings + cautions
+
+    def watch_candidates(self):
+        """감시로 걸 수 있는 매크로 [(참조, 표시이름)]. 자기 자신은 뺀다.
+
+        라이브러리 매크로와, 지금 매크로가 가족 안에 있으면 그 가족의 하위
+        매크로 중 감시 조건(watch)을 가진 것만 고른다.
+        """
+        own = os.path.normcase(os.path.abspath(self.macro.path)) \
+            if self.macro.path else None
+        found = []
+        entries = []
+        try:
+            entries.extend(graph_model.list_macros(MACROS_DIR))
+        except Exception:
+            pass
+        root, _sub = self._family_state()
+        if root:
+            entries.extend(graph_model.list_sub_macros(root))
+        for ref, name, path in entries:
+            if own and os.path.normcase(os.path.abspath(path)) == own:
+                continue
+            data = graph_model.read_macro_file(path)
+            if data is not None and graph_model.is_watch_macro(data):
+                found.append((ref, name))
+        return found
+
     # ------------------------------------------------------- 모드 (트리/그래프)
 
     def apply_mode(self):
         """매크로 형식에 맞춰 가운데 화면을 노드 캔버스 / 트리 중 하나로 바꾼다."""
+        # 매크로가 바뀌면 [이어서 실행] 도 그 매크로 기준으로 다시 본다
+        self.refresh_resume_button()
         if self.macro.is_graph:
             self.mode = "graph"
             self.graph = graph_model.Graph(self.macro.data)
@@ -1881,7 +1996,7 @@ class MacroEditorApp(object):
 
     # ------------------------------------------------------------- 속성 패널
 
-    def _watch_field(self, read, commit):
+    def _watch_field(self, widget, read, commit):
         """타이핑으로 고치는 칸 하나를 '아직 안 넣었을 수 있는 것'으로 등록한다.
 
         반환한 함수를 <FocusOut>/<Return> 에 걸면 된다.
@@ -1893,6 +2008,11 @@ class MacroEditorApp(object):
         Enter 를 치지 않고 노드를 클릭하면 방금 친 값이 조용히 사라졌던 이유다.
         그래서 패널을 지우기(그리고 저장/실행하기) 직전에 여기 등록된 것을
         먼저 반영한다.
+
+        `widget` 을 함께 들고 있는 이유: 위젯이 사라진 뒤에도 StringVar 는
+        살아 있어서 read() 가 계속 값을 돌려준다. 그대로 두면 이미 닫힌
+        조건 편집 창의 입력칸이 나중에 flush 될 때 그 창이 쓰던 dict 에
+        값을 다시 써 넣는다. 위젯이 죽으면 등록도 버린다.
         """
         state = {"was": read()}
 
@@ -1910,7 +2030,7 @@ class MacroEditorApp(object):
         def pending():
             return read() != state["was"]
 
-        self._prop_commits.append((pending, commit_now))
+        self._prop_commits.append((widget, pending, commit_now))
         return commit_now
 
     def flush_property_edits(self):
@@ -1921,21 +2041,27 @@ class MacroEditorApp(object):
         """
         if self._flushing_props:
             return
-        # 목록은 비우지 않는다. 아직 살아 있는 칸의 등록까지 버리면 다음
-        # flush 가 그 칸을 놓친다. commit_now 가 기준값을 새로 잡으므로
-        # 같은 값을 두 번 쓰는 일은 없다. 목록은 build_properties 가 비운다.
+        # 살아 있는 등록은 남긴다. 여기서 목록을 통째로 비우면 아직 화면에
+        # 있는 칸을 다음 flush 가 놓친다. 목록은 build_properties 가 비운다.
         self._flushing_props = True
         try:
-            for is_pending, commit_now in list(self._prop_commits):
+            alive = []
+            for entry in list(self._prop_commits):
+                widget, is_pending, commit_now = entry
                 try:
-                    if not is_pending():
-                        continue
+                    if not widget.winfo_exists():
+                        continue          # 위젯이 사라졌다 - 등록을 버린다
+                    changed = is_pending()
                 except tk.TclError:
-                    continue      # 위젯이 이미 사라졌다
+                    continue
+                alive.append(entry)
+                if not changed:
+                    continue
                 try:
                     commit_now()
                 except tk.TclError:
                     pass
+            self._prop_commits = alive
         finally:
             self._flushing_props = False
 
@@ -2152,7 +2278,7 @@ class MacroEditorApp(object):
                 combo.set(ref)
                 changed()
                 self._warn_missing_call(ref)
-            watched_ref = self._watch_field(lambda: combo.get(), commit_ref)
+            watched_ref = self._watch_field(combo, lambda: combo.get(), commit_ref)
             combo.bind("<<ComboboxSelected>>", watched_ref)
             combo.bind("<FocusOut>", watched_ref)
             combo.bind("<Return>", watched_ref)
@@ -2221,7 +2347,7 @@ class MacroEditorApp(object):
                     target.pop(name, None)
                 changed()
             watched_text = self._watch_field(
-                lambda: widget.get("1.0", "end-1c"), on_text)
+                widget, lambda: widget.get("1.0", "end-1c"), on_text)
             widget.bind("<FocusOut>", watched_text)
             widget.bind("<KeyRelease>", watched_text)
 
@@ -2259,7 +2385,7 @@ class MacroEditorApp(object):
                         % u"', '".join(gone))
                     self.root.after_idle(self.build_properties)
                 changed()
-            watched = self._watch_field(lambda: var.get(), commit)
+            watched = self._watch_field(entry, lambda: var.get(), commit)
             entry.bind("<FocusOut>", watched)
             entry.bind("<Return>", watched)
 
@@ -2368,6 +2494,7 @@ class MacroEditorApp(object):
 
         for entry in (name_entry, values_entry):
             watched = self._watch_field(
+                entry,
                 lambda nv=name_var, vv=values_var: (nv.get(), vv.get()), commit)
             entry.bind("<FocusOut>", watched)
             entry.bind("<Return>", watched)
@@ -2438,7 +2565,7 @@ class MacroEditorApp(object):
                     self.status.set(u"%s" % exc)
                     return
                 changed()
-            watched = self._watch_field(lambda v=var: v.get(), commit)
+            watched = self._watch_field(entry, lambda v=var: v.get(), commit)
             entry.bind("<FocusOut>", watched)
             entry.bind("<Return>", watched)
 
@@ -2984,6 +3111,7 @@ class MacroEditorApp(object):
             ("defaultSimilarity", u"기본 정확도", "float"),
             ("defaultTimeout", u"기본 제한시간(초)", "float"),
             ("stepDelay", u"단계 간 대기(초)", "float"),
+            ("defaultSettle", u"기본 멈춤 확인(초)", "float"),
             ("ocrLanguage", u"글자 인식 언어", "str"),
         ]
         vars_ = {}
@@ -3054,6 +3182,244 @@ class MacroEditorApp(object):
         ttk.Button(bar, text=u"확인", command=apply_).pack(side="right", padx=3)
         ttk.Button(bar, text=u"취소", command=dialog.destroy).pack(side="right")
 
+    def edit_watch(self):
+        """감시 설정 - 이 매크로가 거는 감시 목록과, 이 매크로 자신의 감시 조건.
+
+        둘은 서로 다른 역할이다. 위쪽은 '이 매크로가 도는 동안 무엇을
+        감시할지', 아래쪽은 '이 매크로를 다른 매크로가 감시로 걸 수 있게
+        할지' 다. 한 매크로가 둘 다 가질 수는 있지만, 감시로 불려서 도는
+        동안에는 감시하지 않으므로 그때 위쪽 목록은 쓰이지 않는다.
+        """
+        self.flush_property_edits()
+        data = self.macro.data
+        dialog = tk.Toplevel(self.root)
+        dialog.title(u"감시 설정")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        _root, editing_sub = self._family_state()
+
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill="both", expand=True)
+
+        # ---------------------------------------------- 이 매크로가 거는 감시
+        box = ttk.LabelFrame(frame, text=u"이 매크로가 도는 동안 걸 감시 매크로",
+                             padding=8)
+        box.pack(fill="x")
+        ttk.Label(box, style="Dim.TLabel", wraplength=440, justify="left",
+                  text=u"목록 순서대로 확인합니다. 이 매크로를 부른 쪽(부모)의 "
+                       u"감시가 먼저 돌고, 이 매크로가 끝나면 이 목록은 "
+                       u"걷힙니다. 최상위로 실행하면 실행 내내 걸리는 전역 "
+                       u"감시가 됩니다.").pack(anchor="w", pady=(0, 6))
+
+        row = ttk.Frame(box)
+        row.pack(fill="x")
+        listbox = tk.Listbox(row, height=5, exportselection=False)
+        listbox.pack(side="left", fill="both", expand=True)
+        buttons = ttk.Frame(row)
+        buttons.pack(side="left", padx=(6, 0))
+
+        def refs():
+            current = data.get("handlers")
+            return current if isinstance(current, list) else []
+
+        def store(new_refs, select=None):
+            if new_refs:
+                data["handlers"] = new_refs
+            else:
+                data.pop("handlers", None)
+            self.mark_dirty()
+            redraw(select)
+
+        def redraw(select=None):
+            listbox.delete(0, "end")
+            names = dict(self.watch_candidates())
+            for ref in refs():
+                name = names.get(ref)
+                if name is None:
+                    label = u"%s   ⚠ 감시 매크로가 아니거나 찾을 수 없음" % ref
+                else:
+                    label = self._ref_label(ref, name)
+                listbox.insert("end", label)
+            if select is not None and 0 <= select < listbox.size():
+                listbox.selection_set(select)
+
+        def selected():
+            picked = listbox.curselection()
+            return picked[0] if picked else None
+
+        def add():
+            have = set(refs())
+            choices = [(r, n) for r, n in self.watch_candidates() if r not in have]
+            if not choices:
+                messagebox.showinfo(
+                    u"감시 추가",
+                    u"걸 수 있는 감시 매크로가 없습니다.\n\n감시 매크로를 "
+                    u"만들려면 그 매크로를 열고 [도구 → 감시 설정] 아래쪽에서 "
+                    u"'감시 매크로로 쓴다' 를 켜고 감시 조건을 정하세요.",
+                    parent=dialog)
+                return
+            picked = self._choose_from(dialog, u"감시 매크로 추가",
+                                       [self._ref_label(r, n) for r, n in choices])
+            dialog.grab_set()
+            if picked is not None:
+                store(refs() + [choices[picked][0]], len(refs()))
+
+        def remove():
+            index = selected()
+            if index is None:
+                return
+            new_refs = list(refs())
+            new_refs.pop(index)
+            store(new_refs, min(index, len(new_refs) - 1))
+
+        def move(delta):
+            index = selected()
+            if index is None:
+                return
+            target = index + delta
+            new_refs = list(refs())
+            if not 0 <= target < len(new_refs):
+                return
+            new_refs[index], new_refs[target] = new_refs[target], new_refs[index]
+            store(new_refs, target)
+
+        for text, command in ((u"추가", add), (u"빼기", remove),
+                              (u"위로", lambda: move(-1)),
+                              (u"아래로", lambda: move(1))):
+            ttk.Button(buttons, text=text, width=7, command=command).pack(pady=1)
+        redraw()
+
+        interval_row = ttk.Frame(box)
+        interval_row.pack(fill="x", pady=(8, 0))
+        ttk.Label(interval_row, text=u"확인 간격(초)").pack(side="left")
+        settings = data.setdefault("settings", {})
+        interval_var = tk.StringVar(
+            value=self._value_to_text(settings.get("handlerInterval")))
+        interval_entry = ttk.Entry(interval_row, textvariable=interval_var,
+                                   width=8)
+        interval_entry.pack(side="left", padx=6)
+        if editing_sub:
+            interval_entry.configure(state="disabled")
+            note = u"하위 매크로는 부모의 간격을 따릅니다"
+        else:
+            note = (u"비우면 %.1f초. 한 바퀴 확인이 끝난 뒤 이만큼 지나야 다시 "
+                    u"확인합니다. 최상위로 실행될 때의 값 하나만 쓰입니다"
+                    % graph_model.DEFAULT_HANDLER_INTERVAL)
+        ttk.Label(box, text=note, style="Dim.TLabel", wraplength=440,
+                  justify="left").pack(anchor="w", pady=(2, 0))
+
+        def commit_interval():
+            if editing_sub:
+                return True
+            text = interval_var.get().strip()
+            if text == "":
+                settings.pop("handlerInterval", None)
+                return True
+            try:
+                value = float(text)
+                if value < 0:
+                    raise ValueError(u"0 이상이어야 합니다")
+            except ValueError as exc:
+                messagebox.showerror(u"입력 오류", u"확인 간격: %s" % exc,
+                                     parent=dialog)
+                return False
+            if settings.get("handlerInterval") != value:
+                settings["handlerInterval"] = value
+                self.mark_dirty()
+            return True
+
+        # ---------------------------------------------- 이 매크로의 감시 조건
+        watch_box = ttk.LabelFrame(frame, text=u"이 매크로를 감시 매크로로 쓰기",
+                                   padding=8)
+        watch_box.pack(fill="x", pady=(10, 0))
+        enabled = tk.BooleanVar(value=graph_model.is_watch_macro(data))
+        holder = ttk.Frame(watch_box)
+
+        def show_condition():
+            for child in holder.winfo_children():
+                child.destroy()
+            if not enabled.get():
+                holder.pack_forget()
+                return
+            holder.pack(fill="x", pady=(6, 0))
+            ConditionEditor(holder, self,
+                            lambda: data.get("watch"),
+                            lambda value: (data.__setitem__("watch", value),
+                                           self.mark_dirty())
+                            ).pack(fill="x")
+            ttk.Label(holder, style="Dim.TLabel", wraplength=440,
+                      justify="left",
+                      text=u"조건은 기다리지 않고 지금 화면만 봅니다 (제한시간은 "
+                           u"쓰이지 않습니다). 참이면 이 매크로의 노드를 처음부터 "
+                           u"실행합니다. 확인할 때마다 화면을 읽으므로 영역을 "
+                           u"좁게 잡으세요.").pack(anchor="w", pady=(6, 0))
+
+        def toggle():
+            if enabled.get():
+                if not graph_model.is_watch_macro(data):
+                    data["watch"] = schema.new_condition("imageExists")
+            else:
+                data.pop("watch", None)
+            self.mark_dirty()
+            show_condition()
+
+        ttk.Checkbutton(watch_box, text=u"감시 매크로로 쓴다 (다른 매크로의 "
+                                        u"감시 목록에 걸 수 있게 한다)",
+                        variable=enabled, command=toggle).pack(anchor="w")
+        show_condition()
+
+        def close():
+            self.flush_property_edits()
+            if not commit_interval():
+                return
+            dialog.destroy()
+            self.status.set(u"감시 설정을 바꿨습니다 - 저장해야 반영됩니다"
+                            if self.macro.dirty else u"감시 설정")
+
+        dialog.protocol("WM_DELETE_WINDOW", close)
+        bar = ttk.Frame(dialog, padding=(12, 0, 12, 12))
+        bar.pack(fill="x")
+        ttk.Button(bar, text=u"닫기", command=close).pack(side="right")
+
+    def _choose_from(self, parent, title, labels):
+        """목록에서 하나를 고르게 한다. 고른 위치, 취소하면 None."""
+        dialog = tk.Toplevel(parent)
+        dialog.title(title)
+        dialog.transient(parent)
+        dialog.grab_set()
+        listbox = tk.Listbox(dialog, height=min(12, max(4, len(labels))),
+                             width=48, exportselection=False)
+        listbox.pack(fill="both", expand=True, padx=10, pady=10)
+        for label in labels:
+            listbox.insert("end", label)
+        listbox.selection_set(0)
+        result = {"index": None}
+
+        def confirm(_e=None):
+            picked = listbox.curselection()
+            if picked:
+                result["index"] = picked[0]
+            dialog.destroy()
+
+        listbox.bind("<Double-Button-1>", confirm)
+        listbox.bind("<Return>", confirm)
+        bar = ttk.Frame(dialog, padding=(10, 0, 10, 10))
+        bar.pack(fill="x")
+        ttk.Button(bar, text=u"추가", command=confirm).pack(side="right", padx=3)
+        ttk.Button(bar, text=u"취소", command=dialog.destroy).pack(side="right")
+        listbox.focus_set()
+        dialog.wait_window()
+        return result["index"]
+
+    @staticmethod
+    def system_dpi():
+        """OculiX 가 보는 시스템 DPI. 96 x 화면 배율 (이 PC 는 125% 라 120).
+
+        투명 템플릿 검사(pnginfo.mask_dpi_risk)의 기준이다. 편집기가 캡처한
+        템플릿에는 이 값이 기록된다.
+        """
+        return 96.0 * screenutil.scale()[0]
+
     def validate_macro(self):
         self.flush_property_edits()
         warnings = []
@@ -3063,6 +3429,12 @@ class MacroEditorApp(object):
             problems = self.macro.validate(warnings)
         missing = self.macro.missing_images()
         problems = list(problems) + self.check_call_targets()
+        handler_errors, handler_warnings = self.check_handler_targets()
+        problems.extend(handler_errors)
+        warnings = list(warnings) + handler_warnings
+        warnings.extend(u"이미지 %s (%s): %s" % (name, where, why)
+                        for where, name, why
+                        in self.macro.risky_images(self.system_dpi()))
 
         for w in warnings:
             self.log_line(u"경고: %s" % w, "err")
@@ -3155,7 +3527,42 @@ class MacroEditorApp(object):
             return
         self.run_macro(start_node=picked[0])
 
-    def run_macro(self, start_node=None):
+    def resume_macro(self):
+        """지난 실패 때 남긴 위치 - **실패한 노드** - 부터 이어서 실행한다."""
+        saved = runner.read_resume(self.macro.path)
+        if not saved:
+            self.status.set(u"이어서 실행할 위치가 없습니다")
+            return
+        if not messagebox.askyesno(
+                u"이어서 실행",
+                u"실패한 노드부터 이어서 실행합니다.\n\n%s\n\n"
+                u"(%s 에 실패: %s)\n\n"
+                u"지나고 있던 반복은 각각 그 회차부터 이어서 돕니다.\n"
+                u"게임/앱 화면이 실패했던 그 자리에 있어야 합니다. 엉뚱한 "
+                u"화면이면 그대로 입력이 들어갈 수 있습니다.\n\n계속할까요?"
+                % (runner.describe_resume(saved),
+                   saved.get("savedAt") or u"?",
+                   saved.get("reason") or u"?")):
+            return
+        self.run_macro(resume=True)
+
+    def refresh_resume_button(self):
+        """[이어서 실행] 을 켤지 정한다. 이 매크로의 실패 기록이 있을 때만 켠다."""
+        button = self.resume_button
+        if button is None:
+            return
+        saved = runner.read_resume(self.macro.path)
+        if saved:
+            state, text = "normal", (u"⏭ 이어서: %s"
+                                     % (saved.get("failedName") or u"?"))
+        else:
+            state, text = "disabled", u"⏭ 이어서 실행 (Ctrl+F5)"
+        try:
+            button.config(state=state, text=text)
+        except tk.TclError:
+            pass
+
+    def run_macro(self, start_node=None, resume=False):
         if self.job and self.job.is_running():
             return
         # dirty 판정보다 먼저다. 아직 안 들어간 값이 있으면 dirty 가 아니어서
@@ -3173,25 +3580,93 @@ class MacroEditorApp(object):
                                        u"검사에서 문제가 나왔습니다. 그래도 실행할까요?"):
                 return
 
+        node = self.graph.node(start_node) if (start_node and self.graph) else None
+        label = schema.summarize(node) if node else None
+
         self.log_line(u"", None)
+        # 파일을 먼저 연다. 아래 머리말부터 파일에도 함께 들어가야 한다.
+        self._open_runlog(start_node, label)
         self.log_line(u"===== 실행: %s =====" % self.macro.path, "info")
         if start_node:
-            node = self.graph.node(start_node) if self.graph else None
-            label = schema.summarize(node) if node else start_node
-            self.log_line(u"===== 시작 노드: %s (%s) =====" % (start_node, label),
-                          "info")
+            self.log_line(u"===== 시작 노드: %s (%s) ====="
+                          % (start_node, label or start_node), "info")
         self.run_button.config(state="disabled")
         self.stop_button.config(state="normal")
-        self.status.set(u"실행 중...%s" % (u" (선택 노드부터)" if start_node else u""))
+        if self.resume_button is not None:
+            self.resume_button.config(state="disabled")
+        self.status.set(u"실행 중...%s" % (
+            u" (이어서)" if resume
+            else (u" (선택 노드부터)" if start_node else u"")))
+        if not resume:
+            # 처음부터 도는 실행이다. 낡은 기록이 남아 있으면 이번 실행이
+            # 성공해도 [이어서 실행] 이 켜진 채로 남는다.
+            runner.clear_resume()
         self.job = runner.run_macro(
             self.macro.path,
             lambda text: self.log_queue.put((text, None)),
             lambda code: self.log_queue.put((("__DONE__", code), None)),
-            start_node=start_node)
+            start_node=start_node, resume=resume)
+        self._start_pause_controls()
 
     def stop_macro(self):
         if self.job:
             self.job.stop()
+
+    # ------------------------------------------------------------ 일시정지
+
+    def toggle_pause(self):
+        """일시정지 / 재개. 툴바 버튼과 F6 이 함께 쓴다."""
+        job = self.job
+        if not job or not job.is_running():
+            return
+        if self.paused:
+            job.unpause()
+            self.paused = False
+            self.pause_button.config(text=PAUSE_LABEL)
+            self.status.set(u"실행 중...")
+            return
+        if not job.pause():
+            self.status.set(u"일시정지를 요청하지 못했습니다")
+            return
+        self.paused = True
+        self.pause_button.config(text=RESUME_LABEL)
+        # 아직 멈춘 것이 아니다. 엔진이 멈추면 로그 표식으로 알려 온다.
+        self.status.set(u"일시정지 요청 - 진행 중인 동작이 끝나면 멈춥니다")
+
+    def _start_pause_controls(self):
+        """실행을 시작할 때. 버튼을 켜고 전역 단축키를 등록한다."""
+        self.paused = False
+        self.pause_button.config(state="normal", text=PAUSE_LABEL)
+        if self.pause_hotkey is None:
+            # 메시지 스레드에서 불린다. tkinter 를 건드리면 안 되므로 큐로 넘긴다.
+            self.pause_hotkey = hotkey.GlobalHotkey(
+                hotkey.VK_F6,
+                lambda: self.log_queue.put((("__PAUSE_KEY__", None), None)))
+        if not self.pause_hotkey.start():
+            self.log_line(u"전역 단축키 F6 을 쓸 수 없습니다: %s. 일시정지는 "
+                          u"툴바 버튼이나 편집기 창 안에서의 F6 으로 하세요"
+                          % self.pause_hotkey.error, "err")
+
+    def _stop_pause_controls(self):
+        """실행이 끝났을 때. 끝난 뒤에는 F6 을 다른 프로그램에 돌려준다."""
+        self.paused = False
+        if self.pause_button is not None:
+            self.pause_button.config(state="disabled", text=PAUSE_LABEL)
+        if self.pause_hotkey is not None:
+            self.pause_hotkey.stop()
+
+    def _note_pause_line(self, text):
+        """엔진의 로그 줄에서 정말 멈췄는지 / 다시 가는지를 읽는다.
+
+        게임 창을 보고 있으면 F6 이 먹었는지 눈으로 알 수 없으므로 소리로도
+        알린다. 알림 창은 쓰지 않는다 - 화면에 뜨면 매칭을 가릴 수 있다.
+        """
+        if graph_model.PAUSED_MARK in text and u"주의" not in text:
+            self.status.set(u"일시정지됨 - F6 또는 [재개] 로 이어서 진행합니다")
+            _beep(880)
+        elif graph_model.RESUMED_MARK in text:
+            self.status.set(u"실행 중...")
+            _beep(660)
 
     def _drain_log(self):
         try:
@@ -3199,6 +3674,9 @@ class MacroEditorApp(object):
                 payload, _ = self.log_queue.get_nowait()
                 if isinstance(payload, tuple) and payload[0] == "__DONE__":
                     self._on_run_done(payload[1])
+                elif isinstance(payload, tuple) \
+                        and payload[0] == "__PAUSE_KEY__":
+                    self.toggle_pause()
                 else:
                     tag = None
                     lowered = payload.lower()
@@ -3207,6 +3685,7 @@ class MacroEditorApp(object):
                     elif "ok ===" in lowered or "정상" in payload:
                         tag = "ok"
                     self.log_line(payload, tag)
+                    self._note_pause_line(payload)
         except queue.Empty:
             pass
         self.root.after(80, self._drain_log)
@@ -3214,6 +3693,7 @@ class MacroEditorApp(object):
     def _on_run_done(self, code):
         self.run_button.config(state="normal")
         self.stop_button.config(state="disabled")
+        self._stop_pause_controls()
         cancelled = bool(self.job and self.job.cancelled)
         if code == 0:
             self.log_line(u"===== 정상 종료 (exit 0) =====", "ok")
@@ -3224,6 +3704,8 @@ class MacroEditorApp(object):
         else:
             self.log_line(u"===== 종료 코드 %s =====" % code, "err")
             self.status.set(u"오류 (exit %s)" % code)
+        self._close_runlog(code, cancelled)
+        self.refresh_resume_button()
         self._notify_run_done(code, cancelled)
 
     def _on_notify_toggle(self):
@@ -3253,9 +3735,46 @@ class MacroEditorApp(object):
         notify.notify(u"OculiX 매크로 — %s" % name, result,
                       on_error=lambda text: self.log_line(text, "err"))
 
+    # ----------------------------------------------------------- 실행 로그
+
+    def _open_runlog(self, start_node=None, start_label=None):
+        """이번 실행을 기록할 파일을 연다.
+
+        열지 못해도 실행은 계속한다. 로그를 남기려다 매크로를 못 돌리면
+        본말이 전도된다.
+        """
+        self.runlog = None
+        try:
+            self.runlog = runlog.start(
+                self.macro.path,
+                macro_name=self.macro.data.get("name"),
+                start_node=start_node, start_label=start_label)
+        except Exception as exc:
+            self.log_line(u"실행 로그 파일을 열지 못했습니다: %s" % exc, "err")
+
+    def _close_runlog(self, code, cancelled):
+        """실행 결과를 적고 로그 파일을 닫는다. 경로를 패널에 알려 준다."""
+        if not self.runlog:
+            return
+        path = self.runlog.path
+        self.runlog.finish(code, cancelled)
+        self.runlog = None
+        self.log_line(u"===== 로그 저장: %s =====" % path, "info")
+
+    def open_log_folder(self):
+        """실행 로그가 쌓이는 폴더를 탐색기로 연다."""
+        try:
+            os.startfile(runlog.ensure_dir())
+        except Exception as exc:
+            self.log_line(u"로그 폴더를 열지 못했습니다: %s" % exc, "err")
+            self.status.set(u"로그 폴더를 열지 못했습니다")
+
     def log_line(self, text, tag=None):
         # 패널이 다시 지어질 때 내용을 잃지 않도록 버퍼에도 남긴다
         self._log_buffer.append((text, tag))
+        # 실행 중이면 파일에도 같은 줄을 남긴다 (닫힌 뒤에는 무시된다)
+        if self.runlog is not None:
+            self.runlog.line(text)
         if len(self._log_buffer) > 2000:
             del self._log_buffer[:1000]
         widget = getattr(self, "log", None)
@@ -3304,6 +3823,10 @@ class MacroEditorApp(object):
             self.job.stop()
         if not self._confirm_discard():
             return
+        self._stop_pause_controls()
+        if self.runlog:
+            self.runlog.abort(u"편집기를 닫음")
+            self.runlog = None
         self.save_settings()
         self.root.destroy()
 

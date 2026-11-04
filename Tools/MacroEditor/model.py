@@ -14,6 +14,7 @@ import json
 import os
 
 import graph_model
+import pnginfo
 import schema
 
 # 자식 단계를 담는 컨테이너 키
@@ -290,24 +291,51 @@ class Macro(object):
                     problems.append(u"%s: rgb가 필요합니다" % where)
         return problems
 
-    def missing_images(self):
-        """참조하는데 실제로 없는 이미지 파일 목록."""
+    def _image_refs(self):
+        """(위치, 이름, 절대경로) - 이 매크로가 참조하는 이미지 전부."""
         folder = self.resource_folder
-        missing = []
         if self.is_graph:
             entries = [((n.get("id", "?"),), n) for n in (self.data.get("nodes") or [])]
         else:
             entries = [(p, s) for p, s, _d in self.walk()]
+        refs = []
         for path, step in entries:
             for name in self._images_in(step):
-                if not name:
-                    continue
-                full = name
-                if folder and not os.path.isabs(full):
-                    full = os.path.join(folder, name)
-                if not os.path.exists(full):
-                    missing.append((format_path(path), name))
-        return missing
+                if name:
+                    refs.append((format_path(path), name))
+        for name in schema.condition_images(self.data.get("watch")):
+            if name:
+                refs.append((u"감시 조건", name))
+        out = []
+        for where, name in refs:
+            full = name
+            if folder and not os.path.isabs(full):
+                full = os.path.join(folder, name)
+            out.append((where, name, full))
+        return out
+
+    def missing_images(self):
+        """참조하는데 실제로 없는 이미지 파일 목록."""
+        return [(where, name) for where, name, full in self._image_refs()
+                if not os.path.exists(full)]
+
+    def risky_images(self, system_dpi):
+        """OculiX 마스크 매칭 버그에 걸리는 템플릿. (위치, 이름, 이유) 목록.
+
+        투명 픽셀이 있는데 DPI 가 시스템과 다르면, 대상이 화면에 아직 없을 때
+        'matchTemplateMask' 오류로 바로 실패한다. 자세한 이유는 pnginfo 참조.
+        같은 파일을 여러 노드가 써도 한 번 읽는다.
+        """
+        verdicts = {}
+        out = []
+        for where, name, full in self._image_refs():
+            if not os.path.exists(full):
+                continue
+            if full not in verdicts:
+                verdicts[full] = pnginfo.mask_dpi_risk(full, system_dpi)
+            if verdicts[full]:
+                out.append((where, name, verdicts[full]))
+        return out
 
     @staticmethod
     def _images_in(step):

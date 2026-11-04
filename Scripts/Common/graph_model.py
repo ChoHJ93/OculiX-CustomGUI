@@ -11,6 +11,8 @@
       "version": 2,
       "format": "graph",
       "settings": {..., "maxSteps": 5000, "maxSeconds": 300},
+      "handlers": ["시스템팝업닫기"],        (선택) 도는 동안 걸 감시 매크로
+      "watch": {...조건...},                 (선택) 이 매크로가 감시 매크로일 때
       "entry": "n1",
       "nodes": [
         {"id": "n1", "type": "log", "message": "hi", "ui": {"x": 80, "y": 60}},
@@ -311,6 +313,14 @@ def bind_params(macro, args, allow_refs=False):
             problems.append(u"넘긴 값 '%s' 는 이 매크로에 선언되지 않았습니다"
                             % name)
     return values, problems
+
+
+# 엔진의 Engine.evaluate() 가 실제로 처리하는 조건 종류. 편집기의
+# schema.CONDITION_TYPES 와 이것이 어긋나면 편집기에서 만들 수 있는데
+# 실행하면 죽는 조건이 생긴다. selftest 가 둘을 대조한다.
+CONDITION_TYPES = ("imageExists", "imageMissing", "textExists", "textMissing",
+                   "colorMatches", "paramCompare", "not", "all", "any")
+
 
 
 def _conditions_in(cond):
@@ -736,6 +746,19 @@ class Graph(object):
                 errors.append(u"노드 %s: 조건이 없습니다" % node.get("id"))
 
         errors.extend(validate_params(self.data))
+        errors.extend(validate_handler_decl(self.data, warnings))
+        # 조건에 종류가 없으면 실행할 때 'unknown condition type: None' 으로
+        # 죽는다. 편집기의 AND/OR 목록에는 'None' 이라고만 보여서 왜 안 되는지
+        # 알기 어렵다. 검사에서 먼저 잡는다.
+        for node in self.nodes:
+            for cond in _all_conditions(node):
+                ctype = cond.get("type")
+                if ctype not in CONDITION_TYPES:
+                    errors.append(
+                        u"노드 %s: 조건의 종류가 잘못됐습니다 (%r). "
+                        u"조건을 지우고 다시 넣으세요"
+                        % (node.get("id"), ctype))
+
         # 조건이 참조하는 매개변수가 이 매크로에 선언돼 있는지.
         # 이름을 바꿨을 때 조건이 조용히 어긋나는 것을 막는다.
         known = set(scope_param_names(self.data))
@@ -997,6 +1020,172 @@ def find_call_cycle(ref, base_dir, seen=None):
         if cycle:
             return cycle
     return None
+
+
+# ------------------------------------------------------- 감시 매크로 (handlers)
+#
+# 메인 흐름이 도는 동안 예상하지 못한 팝업 등을 처리하는 매크로.
+#
+#     감시 매크로 (macro.json 최상위)
+#       "watch": {"type": "imageExists", "image": "popup.png", "region": [...]}
+#     감시를 거는 쪽 (부모든 하위든 같은 자리)
+#       "handlers": ["시스템팝업닫기", "./보상창닫기"]
+#
+# 감시 목록은 호출 단계마다 쌓였다가 그 매크로가 끝나면 걷힌다. 최상위
+# 매크로의 목록이 실행 내내 걸리는 '전역' 감시이고, 하위/호출 매크로의 목록은
+# 그 매크로가 도는 동안만 뒤에 붙는다. 확인은 바깥 -> 안쪽 순서다.
+#
+# `handlers` 를 settings 가 아니라 최상위에 두는 이유: 하위 매크로는 자기
+# settings 를 갖지 않고 부모 것을 상속한다. settings 에 두면 하위 매크로가
+# 자기 감시 목록을 가질 수 없다.
+#
+# 감시는 별도 스레드가 아니라 메인 흐름이 **틈틈이** 확인한다 (노드 사이,
+# 대기 노드 안). 입력 장치가 하나뿐이라 동시에 돌리면 입력이 섞이기 때문이다.
+
+# 한 바퀴 확인을 마친 뒤 다음 바퀴까지의 최소 간격(초). 최상위 매크로 설정
+# `handlerInterval` 하나만 쓴다.
+DEFAULT_HANDLER_INTERVAL = 1.0
+
+# 메인이 한 노드도 나아가지 못하는 동안 같은 감시가 이만큼 연달아 걸리면
+# 닫기가 먹지 않는 것으로 보고 실행을 멈춘다.
+HANDLER_REPEAT_LIMIT = 5
+
+# 일시정지 로그 표식. 엔진이 찍고 편집기가 읽어서 "정말 멈췄다"를 안다 -
+# 요청한 순간에는 아직 도는 노드가 있어서 멈춘 것이 아니다.
+PAUSED_MARK = u"[일시정지]"
+RESUMED_MARK = u"[재개]"
+
+
+def watch_condition(macro):
+    """감시 매크로의 감시 조건. 감시 매크로가 아니면 None."""
+    cond = macro.get("watch") if isinstance(macro, dict) else None
+    return cond if isinstance(cond, dict) else None
+
+
+def is_watch_macro(macro):
+    return watch_condition(macro) is not None
+
+
+def handler_refs(macro):
+    """이 매크로가 거는 감시 매크로 참조 목록. 없으면 빈 목록."""
+    refs = macro.get("handlers") if isinstance(macro, dict) else None
+    if not isinstance(refs, list):
+        return []
+    return [r for r in refs if isinstance(r, _TEXT_TYPES) and r.strip()]
+
+
+def handler_interval(macro):
+    """감시 확인 간격(초). 설정이 없거나 잘못됐으면 기본값."""
+    settings = macro.get("settings") if isinstance(macro, dict) else None
+    try:
+        value = float((settings or {}).get("handlerInterval",
+                                           DEFAULT_HANDLER_INTERVAL))
+    except (TypeError, ValueError):
+        return DEFAULT_HANDLER_INTERVAL
+    return value if value >= 0 else DEFAULT_HANDLER_INTERVAL
+
+
+def validate_handler_decl(macro, cautions=None):
+    """감시 관련 선언 자체(파일을 열지 않고 볼 수 있는 것)를 검사한다."""
+    problems = []
+    raw = macro.get("handlers")
+    if raw is not None:
+        if not isinstance(raw, list):
+            problems.append(u"감시 매크로 목록(handlers)은 목록이어야 합니다: %r"
+                            % (raw,))
+        else:
+            seen = set()
+            for ref in raw:
+                if not isinstance(ref, _TEXT_TYPES) or not ref.strip():
+                    problems.append(u"감시 매크로 목록에 빈 칸이 있습니다: %r"
+                                    % (ref,))
+                    continue
+                if ref in seen and cautions is not None:
+                    cautions.append(u"감시 매크로 '%s' 가 목록에 두 번 있습니다. "
+                                    u"한 번만 확인합니다" % ref)
+                seen.add(ref)
+
+    settings = macro.get("settings") or {}
+    if "handlerInterval" in settings:
+        try:
+            if float(settings["handlerInterval"]) < 0:
+                raise ValueError()
+        except (TypeError, ValueError):
+            problems.append(u"감시 확인 간격(handlerInterval)은 0 이상의 "
+                            u"숫자여야 합니다: %r" % (settings["handlerInterval"],))
+
+    if "watch" in macro:
+        problems.extend(validate_watch(macro, cautions))
+    return problems
+
+
+def validate_watch(macro, cautions=None):
+    """감시 조건을 검사한다."""
+    cond = macro.get("watch")
+    if not isinstance(cond, dict) or not cond.get("type"):
+        return [u"감시 조건(watch)이 비어 있습니다"]
+    problems = []
+    for sub in _conditions_in(cond):
+        ctype = sub.get("type")
+        if ctype not in CONDITION_TYPES:
+            problems.append(u"감시 조건의 종류가 잘못됐습니다 (%r)" % (ctype,))
+        elif ctype == "paramCompare":
+            # 감시는 호출 노드 없이 엔진이 직접 확인한다. 값을 넘겨줄 쪽이
+            # 없으니 매개변수 비교는 늘 기본값끼리 비교하게 된다.
+            problems.append(u"감시 조건에는 매개변수 비교를 쓸 수 없습니다")
+        elif ctype in ("imageExists", "imageMissing") and not sub.get("image"):
+            problems.append(u"감시 조건에 이미지가 필요합니다")
+        elif ctype in ("textExists", "textMissing") and not sub.get("text"):
+            problems.append(u"감시 조건에 찾을 글자가 필요합니다")
+        if (ctype in ("imageExists", "imageMissing", "textExists",
+                      "textMissing")
+                and not sub.get("region") and cautions is not None):
+            cautions.append(u"감시 조건에 영역(region)이 없습니다. 확인할 때마다 "
+                            u"화면 전체를 훑어 메인 흐름이 그만큼 느려집니다")
+    return problems
+
+
+def check_handler_refs(macro, base_dir, macro_path=None):
+    """감시 매크로 참조를 실제 파일과 대조한다. (오류, 경고) 를 반환.
+
+    호출 참조와 같은 규칙을 따른다 - 하위 매크로는 같은 가족 안에서만
+    쓸 수 있다. 판정은 참조 표기가 아니라 파일 위치로 한다.
+    """
+    errors = []
+    warnings = []
+    own = os.path.normcase(os.path.abspath(macro_path)) if macro_path else None
+    family = os.path.normcase(family_root(base_dir))
+    for ref in handler_refs(macro):
+        path = resolve_macro_ref(ref, base_dir)
+        if path is None:
+            errors.append(u"감시 매크로를 찾을 수 없습니다: %s" % ref)
+            continue
+        if own and os.path.normcase(os.path.abspath(path)) == own:
+            errors.append(u"자기 자신을 감시 매크로로 걸 수 없습니다: %s" % ref)
+            continue
+        folder = os.path.dirname(os.path.abspath(path))
+        owner = family_root(folder)
+        if owner != folder and os.path.normcase(owner) != family:
+            errors.append(u"'%s' 는 다른 매크로의 하위 매크로입니다. 하위 "
+                          u"매크로는 같은 가족 안에서만 감시로 쓸 수 있습니다"
+                          % ref)
+            continue
+        data = read_macro_file(path)
+        if data is None:
+            errors.append(u"감시 매크로를 읽지 못했습니다: %s" % ref)
+            continue
+        if not is_watch_macro(data):
+            errors.append(u"'%s' 에는 감시 조건(watch)이 없습니다. 감시 매크로로 "
+                          u"쓰려면 그 매크로의 설정에서 감시 조건을 정하세요"
+                          % ref)
+            continue
+        for problem in validate_watch(data):
+            errors.append(u"감시 매크로 '%s': %s" % (ref, problem))
+        if handler_refs(data):
+            warnings.append(u"감시 매크로 '%s' 가 가진 감시 목록은 쓰이지 "
+                            u"않습니다 (감시를 처리하는 동안에는 감시하지 "
+                            u"않습니다)" % ref)
+    return errors, warnings
 
 
 # --------------------------------------------------------------- 파라미터 검증

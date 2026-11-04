@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "..",
     "Scripts", "Common"))
 
+import graph_model
 import model
 import schema
 
@@ -59,9 +60,13 @@ check("엔진 지원 단계가 모두 등록됨", engine_steps <= declared,
 check("엔진에 없는 단계가 없음", declared <= engine_steps,
       "초과: %s" % sorted(declared - engine_steps))
 
-engine_conditions = {"imageExists", "imageMissing", "textExists", "textMissing",
-                     "colorMatches", "not", "all", "any"}
-check("조건 종류 일치", set(schema.CONDITION_TYPES.keys()) == engine_conditions)
+# 목록을 여기 또 적지 않는다. 두 벌이 되면 한쪽만 갱신돼서 (paramCompare 가
+# 그랬다) 멀쩡한 조건을 테스트가 실패로 잡는다.
+engine_conditions = set(graph_model.CONDITION_TYPES)
+check("조건 종류 일치", set(schema.CONDITION_TYPES.keys()) == engine_conditions,
+      "schema 만: %s / graph_model 만: %s"
+      % (sorted(set(schema.CONDITION_TYPES.keys()) - engine_conditions),
+         sorted(engine_conditions - set(schema.CONDITION_TYPES.keys()))))
 
 ok = True
 for stype in schema.STEP_TYPES:
@@ -204,10 +209,16 @@ v2.append(None, None, {"type": "repeat", "times": 3, "maxIterations": 5,
 check("times와 while 동시 사용을 잡아냄",
       any(u"함께" in p for p in v2.validate()))
 
+# 대상 없는 클릭은 '지금 커서 자리에서 실행' 이라 오류가 아니다.
+# 의도한 경우가 드무니 경고로만 알린다 (그래프 형식과 같은 규칙).
 v3 = model.Macro()
 v3.append(None, None, {"type": "click", "steps": []})
-check("click에 image/point 없으면 잡아냄",
-      any("image" in p for p in v3.validate()))
+_v3_cautions = []
+_v3_problems = v3.validate(_v3_cautions)
+check("대상 없는 클릭은 오류가 아니다",
+      not any("image" in p for p in _v3_problems), "%r" % (_v3_problems,))
+check("대상 없는 클릭은 경고로 알린다",
+      any(u"현재 커서 위치" in c for c in _v3_cautions), "%r" % (_v3_cautions,))
 
 v4 = model.Macro()
 v4.append(None, None, {"type": "if", "then": [], "else": []})
@@ -273,6 +284,130 @@ if os.path.exists(example):
     check("Example의 이미지 파일 존재", not missing, "%r" % (missing,))
 else:
     check("Example 매크로 존재", False, example)
+
+
+# --------------------------------------------------------------- 투명 템플릿
+
+section("투명 템플릿 + DPI 불일치 (OculiX matchTemplateMask 버그)")
+
+import pnginfo
+import struct
+import zlib
+
+
+def _png(path, color, rows, dpi=None, filters=(0,)):
+    """테스트용 PNG 를 표준 라이브러리만으로 쓴다.
+
+    rows 는 픽셀 튜플의 줄 목록. filters 의 필터를 줄마다 돌아가며 써서
+    PNG 필터 풀기(_unfilter)까지 지나가게 한다.
+    """
+    channels = {2: 3, 6: 4}[color]
+    width, height = len(rows[0]), len(rows)
+
+    def chunk(kind, body):
+        return (struct.pack(">I", len(body)) + kind + body
+                + struct.pack(">I", zlib.crc32(kind + body) & 0xFFFFFFFF))
+
+    def paeth(a, b, c):
+        p = a + b - c
+        pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+        return a if pa <= pb and pa <= pc else (b if pb <= pc else c)
+
+    raw = bytearray()
+    prev = bytearray(width * channels)
+    for y, row in enumerate(rows):
+        line = bytearray(v for px in row for v in px)
+        kind = filters[y % len(filters)]
+        out = bytearray()
+        for i, v in enumerate(line):
+            left = line[i - channels] if i >= channels else 0
+            up_left = prev[i - channels] if i >= channels else 0
+            pred = {0: 0, 1: left, 2: prev[i], 3: (left + prev[i]) >> 1,
+                    4: paeth(left, prev[i], up_left)}[kind]
+            out.append((v - pred) & 0xFF)
+        raw.append(kind)
+        raw.extend(out)
+        prev = line
+    data = b"\x89PNG\r\n\x1a\n" + chunk(
+        b"IHDR", struct.pack(">IIBBBBB", width, height, 8, color, 0, 0, 0))
+    if dpi is not None:
+        ppm = int(round(dpi / 0.0254))
+        data += chunk(b"pHYs", struct.pack(">IIB", ppm, ppm, 1))
+    data += chunk(b"IDAT", zlib.compress(bytes(raw)))
+    data += chunk(b"IEND", b"")
+    with open(path, "wb") as handle:
+        handle.write(data)
+    return path
+
+
+_pt = tempfile.mkdtemp(prefix="pnginfo_")
+try:
+    _opaque = [[(10 * x, 20 * y, 30, 255) for x in range(6)] for y in range(5)]
+    _holed = [list(r) for r in _opaque]
+    _holed[3][4] = (0, 0, 0, 0)                 # 투명 픽셀 하나 (필터 4 줄)
+    _all_filters = (0, 1, 2, 3, 4)
+
+    p1 = _png(os.path.join(_pt, "holed_nodpi.png"), 6, _holed,
+              filters=_all_filters)
+    info = pnginfo.read(p1)
+    check("필터 0~4 를 풀어 투명 픽셀 하나를 찾는다",
+          info is not None and info.transparent and info.dpi is None,
+          "%r" % (info and (info.transparent, info.dpi),))
+    check("투명 + DPI 기록 없음 -> 위험", pnginfo.mask_dpi_risk(p1, 120.0))
+
+    p2 = _png(os.path.join(_pt, "holed_120.png"), 6, _holed, dpi=119.9896,
+              filters=_all_filters)
+    check("DPI 를 읽는다 (편집기 캡처와 같은 119.99)",
+          abs(pnginfo.read(p2).dpi - 119.9896) < 0.05,
+          "%r" % (pnginfo.read(p2).dpi,))
+    check("투명 + DPI 120 (시스템과 같음) -> 안전",
+          pnginfo.mask_dpi_risk(p2, 120.0) is None)
+
+    p3 = _png(os.path.join(_pt, "holed_96.png"), 6, _holed, dpi=96)
+    check("투명 + DPI 96 -> 위험 (125% PC 에서 실측으로 터진 값)",
+          pnginfo.mask_dpi_risk(p3, 120.0))
+
+    # 알파 채널만 있고 전부 불투명이면 OculiX 가 마스크를 쓰지 않는다.
+    # 이 프로젝트에 그런 파일이 여럿 있어 헛경고를 내면 안 된다.
+    p4 = _png(os.path.join(_pt, "opaque_nodpi.png"), 6, _opaque,
+              filters=_all_filters)
+    check("알파가 있어도 전부 불투명이면 안전",
+          not pnginfo.read(p4).transparent
+          and pnginfo.mask_dpi_risk(p4, 120.0) is None)
+
+    p5 = _png(os.path.join(_pt, "rgb_nodpi.png"), 2,
+              [[px[:3] for px in r] for r in _opaque])
+    check("투명 없는 RGB 는 DPI 와 무관하게 안전",
+          pnginfo.mask_dpi_risk(p5, 120.0) is None)
+
+    p6 = os.path.join(_pt, "not_png.png")
+    with open(p6, "wb") as handle:
+        handle.write(b"GIF89a....")
+    check("PNG 가 아니면 판정하지 않는다", pnginfo.read(p6) is None
+          and pnginfo.mask_dpi_risk(p6, 120.0) is None)
+
+    # 매크로 검사에 연결돼 있는가 - 노드 위치와 함께 한 번만 보고한다
+    mdir = os.path.join(_pt, "Masked")
+    os.makedirs(mdir)
+    _png(os.path.join(mdir, "house.png"), 6, _holed)
+    _png(os.path.join(mdir, "ok.png"), 6, _holed, dpi=119.9896)
+    mm = model.Macro(graph_model.blank(u"투명"))
+    mm.data["nodes"] = [
+        {"id": "n1", "type": "waitImage", "image": "house.png"},
+        {"id": "n2", "type": "click", "image": "house.png"},
+        {"id": "n3", "type": "waitImage", "image": "ok.png"},
+        {"id": "n4", "type": "waitImage", "image": "missing.png"},
+    ]
+    mm.save(os.path.join(mdir, "macro.json"))
+    risky = mm.risky_images(120.0)
+    check("검사가 위험한 템플릿을 쓰는 노드를 모두 짚는다",
+          sorted((w, n) for w, n, _r in risky)
+          == [("n1", "house.png"), ("n2", "house.png")], "%r" % (risky,))
+    check("이유에 오류 이름과 고치는 법이 들어 있다",
+          risky and u"matchTemplateMask" in risky[0][2]
+          and u"[캡처]" in risky[0][2], risky and risky[0][2])
+finally:
+    shutil.rmtree(_pt, ignore_errors=True)
 
 
 # --------------------------------------------------------------- 결과

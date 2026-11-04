@@ -39,6 +39,32 @@ import pixel_util
 
 HARD_ITERATION_CAP = 10000   # last-resort guard against a runaway macro
 
+# 대상이 멈췄는지 확인할 때 두 번 보는 사이의 간격(초).
+# 너무 짧으면 스크롤이 느린 UI 에서 "멈췄다"고 잘못 볼 수 있고,
+# 너무 길면 멀쩡한 화면에서 클릭이 그만큼 늦어진다.
+SETTLE_GAP = 0.2
+
+# 감시가 걸려 있을 때 대기를 이만큼(초)씩 잘라서 기다린다. 자른 사이마다
+# 감시를 확인한다. 실제 확인 주기는 handlerInterval 이 정한다.
+WATCH_SLICE = 0.5
+
+# 일시정지 중에 재개 요청을 확인하는 간격(초).
+PAUSE_POLL = 0.1
+
+# 찾은 자리를 다시 확인할 때 사각형을 이만큼 넓혀서 본다. 몇 픽셀 흔들리는
+# 렌더링까지 "움직였다"고 보지 않으려는 여유다.
+SETTLE_GROW = 8
+
+# 점수가 임계값을 이만큼도 못 넘기면 "아슬아슬하다"고 보고 움직임을 의심한다.
+# 움직이는 중에 찍힌 화면은 흐릿해서 점수가 임계값 언저리로 떨어진다.
+MARGINAL_SCORE = 0.02
+
+# 실패했을 때 "어디까지 갔는지"를 남기는 파일. 편집기가 읽어 '이어서 실행'에 쓴다.
+# Logs 아래라 git 추적 대상이 아니다(.gitignore).
+RESUME_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "Logs", "resume.json")
+
 # WIN / CMD / META 는 OculiX에서 값이 모두 4로 같다.
 _MODIFIERS = {
     "CTRL": KeyModifier.CTRL,
@@ -81,6 +107,56 @@ class TextHit(object):
         self.text = text
 
 
+class PauseGate(object):
+    u"""편집기의 일시정지 요청을 받는 문. 프로세스(실행) 하나에 하나.
+
+    편집기는 별도 프로세스라 신호는 파일 하나로 주고받는다 - 파일이 있으면
+    멈추고, 지우면 간다. 경로는 실행 인자로 받는다(--pause-file). 고정 경로로
+    두면 남은 파일 하나 때문에 명령줄 실행이나 테스트가 영원히 멈출 수 있다.
+    경로를 받지 않은 실행은 아무것도 확인하지 않는다.
+
+    입력 장치를 쓰는 동작 도중에는 멈추지 않는다. 노드 사이와 대기 중에
+    엔진이 스스로 확인할 때만 멈추므로, 진행 중인 클릭/입력/드래그는 끝난다.
+    """
+
+    def __init__(self):
+        self.path = None
+        self.total = 0.0            # 지금까지 멈춰 있던 시간(초)
+        self.held = set()           # mouseDown 으로 누른 채인 버튼
+
+    def configure(self, path):
+        self.path = path or None
+        self.total = 0.0
+        self.held = set()
+
+    def enabled(self):
+        return self.path is not None
+
+    def hold(self, engine, where):
+        """요청이 있으면 풀릴 때까지 멈춘다. 멈춰 있던 시간(초)을 준다."""
+        if self.path is None or not os.path.exists(self.path):
+            return 0.0
+        started = time.time()
+        engine.log(u"%s 멈췄습니다 - %s" % (graph_model.PAUSED_MARK, where))
+        if self.held:
+            # 일부러 떼지 않는다. 드래그 도중이면 떼는 순간 엉뚱한 곳에 놓인다.
+            engine.log(u"%s 주의: 마우스 버튼이 눌린 채입니다 (%s). 재개하면 "
+                       u"그대로 이어 갑니다. 그동안 마우스를 움직이면 "
+                       u"드래그가 어긋납니다"
+                       % (graph_model.PAUSED_MARK,
+                          u", ".join(sorted(self.held))))
+        while os.path.exists(self.path):
+            time.sleep(PAUSE_POLL)
+        spent = time.time() - started
+        self.total += spent
+        engine.log(u"%s %.1f초 멈춰 있었습니다. 이어서 진행합니다"
+                   % (graph_model.RESUMED_MARK, spent))
+        return spent
+
+
+PAUSE = PauseGate()
+
+
 class Engine(object):
 
     def __init__(self, macro, base_dir, logger=None, params=None):
@@ -96,6 +172,9 @@ class Engine(object):
         self.default_similarity = float(settings.get("defaultSimilarity", 0.90))
         self.default_timeout = float(settings.get("defaultTimeout", 10))
         self.step_delay = float(settings.get("stepDelay", 0))
+        # 이미지를 찾은 자리가 이만큼(초) 멈춰 있어야 집는다. 0 이면 확인하지
+        # 않는다(예전과 같은 동작). 스크롤이 끝나기 전에 집는 사고를 막는 값이다.
+        self.default_settle = float(settings.get("defaultSettle", 0))
 
         self.screen = Screen(self.screen_index)
         default_region = settings.get("searchRegion")
@@ -116,7 +195,11 @@ class Engine(object):
         # 같은 창에서 재보면 3은 9칸 중 5칸만 맞혔고 (라벨에 여백을 조금만 둬도
         # 아예 빈 결과가 나왔다), 11(성긴 글자)은 9/9 에 더 빨랐다.
         # 영문 대상에서는 3/4/11 이 모두 8칸 중 7칸으로 같았다.
-        self._set_psm(settings.get("ocrPsm", 11))
+        self._psm = settings.get("ocrPsm", 11)
+        self._set_psm(self._psm)
+
+        # 감시 매크로 관리자 (WatchManager). 감시가 걸린 실행에서만 채워진다.
+        self.watch = None
 
     # ------------------------------------------------------------- utilities
 
@@ -205,10 +288,199 @@ class Engine(object):
         except Exception:
             return None
 
+    # ------------------------------------------------------------- 감시
+
+    def _sliced(self):
+        """대기를 잘라서 기다려야 하는가.
+
+        자른 사이마다 감시와 일시정지를 확인한다. 둘 다 해당 없으면(명령줄
+        실행에 감시도 없는 경우) 예전처럼 한 번에 기다린다.
+        """
+        return PAUSE.enabled() or (self.watch is not None
+                                   and self.watch.active())
+
+    def _wait_tick(self):
+        """대기 중의 끼어들기를 처리한다. 메인이 멈춰 있던 시간(초)을 준다.
+
+        일시정지 요청이 있으면 멈추고, 감시를 돌 때가 됐으면 돈다. 기다리는
+        노드는 이 시간을 제한시간에 더한다 - 메인의 시계는 멈춘 것으로 본다.
+        팝업 하나 닫는 사이나 사용자가 멈춘 사이에 대기가 시간 초과로
+        실패하면 안 된다.
+
+        감시 쪽에서 멈춘 시간을 따로 재는 이유: 감시 조건을 확인하는 도중에
+        일시정지가 걸리면 그 바퀴는 "걸린 것 없음"이라 tick 이 0 을 준다.
+        그것만 믿으면 멈춘 시간이 고스란히 제한시간에서 깎인다.
+        """
+        paused = PAUSE.hold(self, u"대기 중")
+        if self.watch is None:
+            return paused
+        before = PAUSE.total
+        spent = self.watch.tick(self)
+        return paused + max(spent, PAUSE.total - before)
+
+    def _pause_point(self, step):
+        """노드를 시작하기 직전. 여기서 멈추면 그 노드는 아직 실행 전이다."""
+        PAUSE.hold(self, u"다음 노드 실행 전: %s (%s)"
+                   % (self._name(step), step.get("id") or u"-"))
+
+    def _watch_node_start(self):
+        """노드 하나를 시작하기 직전. 메인이 한 걸음 나아갔다고 알리고 확인한다."""
+        if self.watch is None:
+            return
+        self.watch.progress += 1
+        self.watch.tick(self)
+
+    def _watched(self, timeout, attempt):
+        """`attempt(초)` 를 제한시간까지 되풀이하며 사이사이 감시를 확인한다.
+
+        attempt 는 찾으면 결과를, 못 찾으면 None 을 돌려줘야 한다.
+        끼어들 것이 없으면 예전처럼 한 번에 다 기다린다 (_sliced).
+        """
+        if not self._sliced():
+            return attempt(timeout)
+        deadline = time.time() + float(timeout)
+        while True:
+            deadline += self._wait_tick()
+            remaining = deadline - time.time()
+            result = attempt(max(0.0, min(WATCH_SLICE, remaining)))
+            if result is not None:
+                return result
+            if time.time() >= deadline:
+                return None
+
+    def _reapply_ocr(self):
+        """글자 인식 설정을 이 엔진 것으로 되돌린다.
+
+        언어와 psm 은 프로세스 전체에 하나뿐이라, 감시 매크로가 자기 설정으로
+        바꿔 놓으면 메인의 다음 인식이 엉뚱한 설정으로 돈다.
+        """
+        self._set_psm(self._psm)
+        try:
+            Settings.OcrLanguage = self._language
+            OCR.globalOptions().language(self._language)
+        except (Exception, Throwable):
+            pass
+
     def _find(self, step):
         """Locate the step's image. Returns Match or None - never raises."""
         region = self._make_region(step.get("region"))
-        return region.exists(self._pattern(step), self._timeout(step))
+        pattern = self._pattern(step)
+        return self._watched(self._timeout(step),
+                             lambda seconds: region.exists(pattern, seconds))
+
+    def _find_now(self, step):
+        """지금 한 번만 훑는다. 기다리지 않는다."""
+        region = self._make_region(step.get("region"))
+        return region.exists(self._pattern(step), 0)
+
+    def _find_at(self, step, match):
+        """방금 찾은 자리 근처만 다시 본다.
+
+        전체 영역을 훑지 않으므로 거의 공짜다. 대상이 그대로 있는지
+        확인하는 용도다.
+        """
+        # 화면 밖으로 나가지 않게 자른다. 목록 맨 위/맨 아래 항목이면
+        # 넓힌 사각형이 음수 좌표가 된다.
+        x = max(0, match.getX() - SETTLE_GROW)
+        y = max(0, match.getY() - SETTLE_GROW)
+        area = Region(x, y,
+                      match.getW() + (match.getX() - x) + SETTLE_GROW,
+                      match.getH() + (match.getY() - y) + SETTLE_GROW)
+        probe = dict(step)
+        probe.pop("region", None)          # 좁힌 영역이 이미 검색 범위다
+        return area.exists(self._pattern(probe), 0)
+
+    @staticmethod
+    def _same_spot(a, b, slack=SETTLE_GROW):
+        return (abs(a.getX() - b.getX()) <= slack
+                and abs(a.getY() - b.getY()) <= slack)
+
+    def _warn_if_marginal(self, step, match, head=u""):
+        """점수가 임계값에 아슬아슬하면 움직이는 중인지 확인하고 알린다.
+
+        움직이는 중에 찍힌 화면은 흐릿해서 점수가 뚝 떨어진다. 실측한 사고에서
+        멈춰 있을 때는 0.968~0.989 로 찾히던 버튼이, 목록이 스크롤하는 동안에는
+        0.9502 로 찍혔다 (임계값 0.95 를 겨우 넘겼다). 세로로 16px 흔들린
+        이미지를 만들어 재 보면 0.9508 로, 관측값과 같다.
+
+        그래서 **아슬아슬한 점수**를 움직임의 신호로 본다. 넉넉히 넘긴 매칭은
+        확인하지 않으므로, 멀쩡히 도는 매크로에는 시간이 들지 않는다.
+
+        고치지는 않는다 - 알리기만 한다. 실제로 멈추기를 기다리는 것은
+        settleFor 를 준 단계의 몫이다.
+        """
+        threshold = float(step.get("similarity", self.default_similarity))
+        try:
+            score = match.getScore()
+        except Exception:
+            return
+        if score - threshold > MARGINAL_SCORE:
+            return                       # 넉넉히 넘겼다. 볼 것 없다.
+        time.sleep(SETTLE_GAP)
+        again = self._find_at(step, match)
+        if again is not None and self._same_spot(match, again):
+            return                       # 그 자리에 그대로 있다
+        self.log(u"    %s주의: 점수가 %.4f 로 기준(%.2f)에 아슬아슬하고 "
+                 u"대상이 그 자리에 없습니다. 화면이 움직이는 중일 수 있습니다 - "
+                 u"지금 누르면 마우스가 도착할 때쯤 다른 것이 그 자리에 옵니다. "
+                 u"'멈춤 확인(settleFor)' 을 주세요" % (head, score, threshold))
+
+    def _settled(self, step, match, head=u""):
+        """찾은 자리가 멈춰 있는지 확인한다. 움직이는 중이면 멈출 때까지 기다린다.
+
+        왜 필요한가: 찾은 순간과 실제로 누르는 순간 사이에 시간이 있다.
+        OculiX 기본값 `Settings.MoveMouseDelay` 만 해도 0.5초다. 그동안
+        목록이 스크롤을 마저 하면, 마우스가 도착했을 때 그 자리에 있는 것은
+        아까 찾은 항목이 아니라 **바로 옆 항목**이다. 같은 모양의 버튼이
+        세로로 늘어선 목록에서 간헐적으로 엉뚱한 버튼을 누르게 된다.
+
+        `settleFor` (초) 를 준 단계에서만 확인한다. 0 이면 그대로 돌려준다 -
+        멀쩡히 도는 매크로의 속도를 말없이 늦추지 않으려는 것이다.
+        """
+        hold = float(step.get("settleFor", self.default_settle))
+        if match is None:
+            return match
+        if hold <= 0:
+            self._warn_if_marginal(step, match, head)
+            return match
+
+        limit = time.time() + self._timeout(step)
+        steady_since = time.time()
+        moved = False
+        while True:
+            spent = self._wait_tick()
+            if spent:
+                # 감시나 사용자가 화면을 건드렸다. 멈춤 확인을 처음부터 다시 한다.
+                limit += spent
+                steady_since = time.time()
+            time.sleep(SETTLE_GAP)
+            again = self._find_at(step, match)
+            if again is None:
+                # 좁은 창을 벗어났다. 영역 전체를 한 번 더 본다.
+                again = self._find_now(step)
+            if again is None:
+                self.log(u"    %s대상이 잠깐 사라졌습니다. 다시 봅니다" % head)
+            elif self._same_spot(match, again):
+                match = again
+                if time.time() - steady_since >= hold:
+                    if moved:
+                        self.log(u"    %s대상이 (%d,%d) 에서 멈췄습니다"
+                                 % (head, match.getX(), match.getY()))
+                    return match
+            else:
+                self.log(u"    %s대상이 (%d,%d) -> (%d,%d) 로 움직이는 중입니다. "
+                         u"멈추기를 기다립니다"
+                         % (head, match.getX(), match.getY(),
+                            again.getX(), again.getY()))
+                match = again
+                steady_since = time.time()
+                moved = True
+
+            if time.time() > limit:
+                self.log(u"    %s%.1f초 동안 자리가 멈추지 않았습니다. "
+                         u"마지막으로 본 자리로 진행합니다"
+                         % (head, self._timeout(step)))
+                return match
 
     @staticmethod
     def _normalize_text(value):
@@ -235,7 +507,14 @@ class Engine(object):
         남아 있는 값이 덮어써서 이후 인식이 전부 예외로 죽는다 (측정으로 확인).
         """
         language = language or u"eng"
-        if language == self._language:
+        # 언어 설정은 프로세스 전체에 하나뿐이다. 다른 엔진(호출된 매크로,
+        # 감시 매크로)이 그사이 바꿔 놓았을 수 있으므로 기억해 둔 값만 믿지
+        # 않고 실제 값과도 대조한다.
+        try:
+            actual = Settings.OcrLanguage
+        except (Exception, Throwable):
+            actual = language
+        if language == self._language and actual == language:
             return True
         previous = self._language
         try:
@@ -361,6 +640,12 @@ class Engine(object):
         region = self._make_region(step.get("region"))
         deadline = time.time() + self._timeout(step)
         while True:
+            spent = self._wait_tick()
+            if spent:
+                deadline += spent
+                # 감시 매크로가 인식 설정을 바꿔 놓았을 수 있다
+                self._set_language(step.get("ocrLanguage")
+                                   or self._default_language)
             hit = self._scan_text(region, query, for_click)
             if hit is not None:
                 return hit
@@ -405,6 +690,12 @@ class Engine(object):
             match = self._find(step)
             if match is None:
                 self.log(u"    %s이미지 %s 없음" % (head, step["image"]))
+                return None
+            # 누르기 전에 자리가 멈췄는지 본다 (settleFor 를 준 단계만).
+            match = self._settled(step, match, head)
+            if match is None:
+                self.log(u"    %s이미지 %s 가 자리를 잡지 못했습니다"
+                         % (head, step["image"]))
                 return None
             spot = match.getTarget()
             centre = (match.getX() + match.getW() // 2,
@@ -729,6 +1020,8 @@ class Engine(object):
             if step.get("enabled") is False:
                 self.log("--  skipped (disabled): %s" % step.get("type"))
                 continue
+            self._pause_point(step)
+            self._watch_node_start()
             if not self._run_one(step):
                 return False
             if self.step_delay:
@@ -766,6 +1059,10 @@ class Engine(object):
             raise
         except MacroError:
             raise
+        except BudgetExceeded:
+            # 대기 중에 돈 감시 매크로가 예산을 다 썼거나 막혔다. 단계 실패가
+            # 아니라 실행 전체를 멈출 일이다.
+            raise
         except (Exception, Throwable), e:
             self.log(u"    오류 %s: %s" % (e.__class__.__name__, e))
             ok = False
@@ -790,8 +1087,18 @@ class Engine(object):
             return True
 
         if stype == "wait":
-            time.sleep(float(step.get("seconds", 1)))
-            return True
+            seconds = float(step.get("seconds", 1))
+            if not self._sliced():
+                time.sleep(seconds)
+                return True
+            # 감시 처리와 일시정지 동안은 기다린 시간으로 치지 않는다
+            end = time.time() + seconds
+            while True:
+                end += self._wait_tick()
+                left = end - time.time()
+                if left <= 0:
+                    return True
+                time.sleep(min(WATCH_SLICE, left))
 
         if stype == "run":
             return self._run_program(step)
@@ -821,7 +1128,11 @@ class Engine(object):
 
         if stype == "waitVanish":
             region = self._make_region(step.get("region"))
-            gone = region.waitVanish(self._pattern(step), self._timeout(step))
+            pattern = self._pattern(step)
+            gone = self._watched(
+                self._timeout(step),
+                lambda seconds: True if region.waitVanish(pattern, seconds)
+                else None)
             if not gone:
                 self.log("    still visible after %.0fs" % self._timeout(step))
             return bool(gone)
@@ -839,11 +1150,20 @@ class Engine(object):
             return True
 
         if stype == "mouseDown":
-            self.screen.mouseDown(_BUTTONS[step.get("button", "LEFT").upper()])
+            button = step.get("button", "LEFT").upper()
+            self.screen.mouseDown(_BUTTONS[button])
+            PAUSE.held.add(button)
+            if self.watch is not None:
+                # 누른 채로 감시가 끼어들면 드래그가 엉뚱한 곳에서 끝난다
+                self.watch.held.add(button)
             return True
 
         if stype == "mouseUp":
-            self.screen.mouseUp(_BUTTONS[step.get("button", "LEFT").upper()])
+            button = step.get("button", "LEFT").upper()
+            self.screen.mouseUp(_BUTTONS[button])
+            PAUSE.held.discard(button)
+            if self.watch is not None:
+                self.watch.held.discard(button)
             return True
 
         if stype == "drag":
@@ -903,11 +1223,13 @@ class Engine(object):
 
         if stype == "waitColor":
             point = step["point"]
-            got = pixel_util.wait_pixel_color(
-                int(point[0]), int(point[1]), tuple(step["rgb"]),
-                tolerance=step.get("tolerance", 10),
-                timeout=self._timeout(step),
-                interval=float(step.get("interval", 0.1)))
+            got = self._watched(
+                self._timeout(step),
+                lambda seconds: pixel_util.wait_pixel_color(
+                    int(point[0]), int(point[1]), tuple(step["rgb"]),
+                    tolerance=step.get("tolerance", 10),
+                    timeout=seconds,
+                    interval=float(step.get("interval", 0.1))))
             if got is None:
                 self.log("    colour never matched within %.0fs" % self._timeout(step))
                 return False
@@ -992,6 +1314,15 @@ class BudgetExceeded(Exception):
     pass
 
 
+class WatchStuck(BudgetExceeded):
+    """같은 감시가 메인이 나아가지 못하는 동안 계속 걸린다 - 닫기가 먹지 않는다.
+
+    예산 초과와 같은 길로 실행 전체를 멈춘다. 단계 하나의 실패로 다루면
+    실패 핀이나 재시도가 같은 화면에서 같은 일을 되풀이할 뿐이다.
+    """
+    pass
+
+
 NORMAL = "normal"
 BREAK = "break"
 ABORT = "abort"
@@ -1009,9 +1340,22 @@ class GraphEngine(Engine):
     """
 
     def __init__(self, macro, base_dir, logger=None, root=None, call_stack=None,
-                 start_node=None, params=None):
+                 start_node=None, params=None, resume_path=None):
         Engine.__init__(self, macro, base_dir, logger, params=params)
         self.graph = graph_model.Graph(macro)
+        # 지금 어디를 지나고 있는지. 반복/호출로 들어갈 때마다 한 칸 쌓인다.
+        # 파이썬 호출 스택에만 있으면 밖으로 꺼낼 수가 없어서 따로 들고 다닌다.
+        self.frames = []
+        # 실패한 자리 (가장 안쪽 것 하나만 남긴다). 그 순간 지나고 있던
+        # 반복/호출이 몇 겹이든 전부 담긴다 - 재시도와 '이어서 실행'이
+        # 이 경로를 되짚어 실패한 노드로 곧장 들어간다.
+        self.failed_at = None
+        self.failed_name = None
+        # 이번 실행을 이 경로부터 이어서 한다면 그 경로
+        self.resume_path = resume_path
+        # 이어서 실행할 위치를 남길 때 쓸 '진짜' 매크로 파일 경로.
+        # 하위 매크로는 base_dir 이 부모로 바뀌므로 그것으로는 알 수 없다.
+        self.macro_path = None
         # 이번 실행에만 쓰는 시작 지점. 매크로에 저장된 entry 는 건드리지 않는다.
         # 호출된 매크로는 늘 자기 entry 에서 시작하므로 물려주지 않는다.
         self.start_node = start_node
@@ -1025,6 +1369,36 @@ class GraphEngine(Engine):
         # 루트 엔진 하나가 전체 실행의 예산과 호출 스택을 갖는다.
         self.root = root or self
         self.call_stack = call_stack if call_stack is not None else []
+        # 하위 매크로를 단독으로 돌릴 때 부모의 감시 목록. make_engine 이 채운다.
+        # (부모 매크로, 부모 폴더, 부모 macro.json 경로)
+        self.inherited_handlers = None
+
+    def _start_watch(self):
+        """최상위 실행의 감시('전역' 감시)를 건다.
+
+        걸 감시가 없어도 관리자는 만든다. 최상위에는 감시가 없고 호출된
+        매크로에만 있는 경우에도 그 감시가 걸려야 하기 때문이다.
+
+        하위 매크로를 단독으로 돌릴 때는 부모의 감시를 먼저 건다. 호출로
+        돌 때와 같은 문맥이어야 단독 실행으로 확인한 것이 본 실행에서도 맞다.
+        """
+        layers = []
+        if self.inherited_handlers:
+            parent, parent_dir, parent_path = self.inherited_handlers
+            layers.append((parent, parent_dir, parent_path))
+        layers.append((self.macro, self.base_dir, self.macro_path))
+        watch = WatchManager(self, graph_model.handler_interval(self.macro))
+        try:
+            for macro, folder, path in layers:
+                if graph_model.handler_refs(macro):
+                    watch.push(self, macro, folder, path)
+        except MacroError, e:
+            self.log(u"오류: %s" % e)
+            return False
+        self.watch = watch
+        if watch.active():
+            self.log(u"감시 확인 간격: %.1f초" % watch.interval)
+        return True
 
     def run(self):
         # 한글이 들어간 서식 문자열은 반드시 u"" 여야 한다.
@@ -1054,27 +1428,160 @@ class GraphEngine(Engine):
 
         is_root = self.root is self
         if is_root:
+            if not self._start_watch():
+                self.log(u"=== 정의 오류로 실행하지 않음 ===")
+                return False
             self.log(u"예산: 최대 %d단계 / %.0f초" % (self.max_steps, self.max_seconds))
             self.deadline = time.time() + self.max_seconds
 
+        path = self.resume_path
+        if path:
+            if not self._describe_resume(path):
+                return False
+            start = path[0]["node"]
+
         try:
-            status = self._run_chain(start, 0)
+            status = self._run_chain(start, 0, resume=path)
         except BudgetExceeded, e:
             # 예산은 실행 전체에 하나뿐이다. 호출된 매크로 안에서 터졌다면
             # 여기서 삼키지 말고 루트까지 올려보내 실행 전체를 멈춘다.
             if not is_root:
                 raise
+            stuck = isinstance(e, WatchStuck)
             self.log(u"!! %s" % e)
-            self.log(u"=== 예산 초과로 중단 (실행 %d단계) ===" % self.root.executed)
+            self.log(u"=== %s (실행 %d단계) ==="
+                     % (u"감시가 막혀 중단" if stuck else u"예산 초과로 중단",
+                        self.root.executed))
+            self._save_resume(u"감시 막힘" if stuck else u"예산 초과")
             return False
 
         ok = status != ABORT
+        if is_root and not ok:
+            self._save_resume(u"단계 실패")
+        elif is_root:
+            self._clear_resume()
         self.log(u"=== 노드 %d회 실행, 실패 %d -> %s ===" % (
             self.root.executed if is_root else self.stats["steps"],
             self.stats["failed"], "OK" if ok else "ABORTED"))
         return ok
 
+    def _describe_resume(self, path):
+        """이어서 실행할 자리를 확인하고 알린다. 못 쓰면 False."""
+        first = self.graph.node(path[0].get("node"))
+        if first is None:
+            self.log(u"오류: 이어서 실행할 노드 %s 를 이 매크로에서 찾을 수 "
+                     u"없습니다. 매크로를 고쳤다면 저장된 위치는 쓸 수 없습니다"
+                     % path[0].get("node"))
+            return False
+        self.log(u"이어서 실행: %s" % u" > ".join(self._step_text(f) for f in path))
+        return True
+
+    def _step_text(self, frame):
+        node = self.graph.node(frame.get("node"))
+        name = self._name(node) if node else frame.get("node")
+        if frame.get("enter") == "loop":
+            return u"%s[%d회째]" % (name, int(frame.get("done", 0)) + 1)
+        if frame.get("enter") == "call":
+            return u"%s->" % (frame.get("ref") or name)
+        return u"%s" % name
+
+    def _clear_resume(self):
+        """끝까지 성공했으면 이 매크로의 '이어서 실행' 기록을 지운다.
+
+        이어서 실행이 성공한 뒤에도 기록이 남아 있으면 편집기 버튼이 계속
+        켜져 있어서, 다시 누르면 이미 끝낸 지점으로 돌아간다. 다른 매크로의
+        기록은 건드리지 않는다.
+        """
+        try:
+            if not os.path.exists(RESUME_FILE):
+                return
+            handle = open(RESUME_FILE, "rb")
+            try:
+                saved = json.loads(handle.read().decode("utf-8"))
+            finally:
+                handle.close()
+            mine = os.path.normcase(os.path.abspath(self.macro_path or u""))
+            theirs = os.path.normcase(os.path.abspath(saved.get("macro") or u""))
+            if mine == theirs:
+                os.remove(RESUME_FILE)
+        except (Exception, Throwable):
+            pass
+
+    def _save_resume(self, reason):
+        """실패한 순간의 위치를 파일로 남긴다. 편집기의 '이어서 실행'이 읽는다."""
+        if not self.failed_at:
+            self.log(u"실패한 위치를 알 수 없어 이어서 실행할 수 없습니다")
+            return
+        payload = {
+            "macro": self.macro_path or os.path.abspath(
+                os.path.join(self.base_dir, "macro.json")),
+            "macroName": self.macro.get("name") or u"",
+            "savedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "reason": reason,
+            "failedAt": self.failed_at,
+            "failedName": self.failed_name,
+        }
+        try:
+            folder = os.path.dirname(RESUME_FILE)
+            if not os.path.isdir(folder):
+                os.makedirs(folder)
+            handle = open(RESUME_FILE, "wb")
+            try:
+                handle.write(json.dumps(payload, ensure_ascii=False,
+                                        indent=2).encode("utf-8"))
+            finally:
+                handle.close()
+        except (Exception, Throwable), e:
+            self.log(u"이어서 실행할 위치를 남기지 못했습니다: %s" % e)
+            return
+        self.log(u"이어서 실행할 수 있습니다 - 실패한 '%s' 부터 "
+                 u"(편집기의 [이어서 실행])" % (self.failed_name or u"?"))
+
     # ------------------------------------------------------------------ 실행
+
+    # ------------------------------------------------- 실행 위치 기록 / 재개
+
+    def _here(self, node_id, enter=None, **extra):
+        """지금 위치를 나타내는 프레임 하나.
+
+        매크로 이름은 base_dir 이 아니라 매크로가 스스로 밝힌 이름을 쓴다.
+        하위 매크로는 부모 폴더를 base_dir 로 쓰기 때문에, 폴더 이름으로는
+        호출 사슬의 모든 칸이 부모 이름으로 찍힌다. 이 이름은 사람이 기록을
+        읽을 때만 쓰이지만, 진단용 파일에 틀린 이름이 들어가면 안 된다.
+        """
+        frame = {"macro": (self.macro.get("name")
+                           or os.path.basename(os.path.abspath(self.base_dir))),
+                 "node": node_id, "enter": enter}
+        frame.update(extra)
+        return frame
+
+    def _path_to(self, node_id):
+        """루트에서 이 노드까지 내려오는 길 전체. 재개할 때 이 길을 되짚는다."""
+        return [dict(f) for f in self.root.frames] + [self._here(node_id)]
+
+    def _note_failure(self, node_id):
+        """실패한 자리를 남긴다. 가장 안쪽 것 하나만 - 밖으로 번지며
+        덮어쓰면 어디서 처음 터졌는지 알 수 없다."""
+        if self.root.failed_at is None:
+            self.root.failed_at = self._path_to(node_id)
+            node = self.graph.node(node_id)
+            self.root.failed_name = self._name(node) if node else node_id
+
+    def _forget_failure(self):
+        """실패를 실패 핀이나 '무시하고 계속'으로 넘겼다. 기록을 지운다.
+
+        안쪽 노드가 실패해 위치가 남은 뒤 바깥 호출 노드의 실패 핀이 그걸
+        복구하면, 지우지 않는 한 낡은 위치가 남아 나중의 진짜 실패를
+        가린다 (가장 안쪽 하나만 남기는 규칙 때문에 덮어쓰지 못한다).
+        """
+        self.root.failed_at = None
+        self.root.failed_name = None
+
+    def _consume_resume(self, resume, node_id):
+        """복원 경로의 머리가 이 노드를 가리키면 (프레임, 나머지) 를 준다."""
+        if resume and resume[0].get("node") == node_id:
+            return resume[0], list(resume[1:])
+        return None, None
 
     def _spend(self, node_id):
         root = self.root
@@ -1083,7 +1590,10 @@ class GraphEngine(Engine):
             raise BudgetExceeded(
                 u"실행 단계가 상한 %d를 넘었습니다 (노드 %s). "
                 u"연결에 순환이 있는지 확인하세요." % (root.max_steps, node_id))
-        if root.deadline is not None and time.time() > root.deadline:
+        # 멈춰 있던 시간은 실행 시간으로 치지 않는다. 사용자가 10분 멈췄다고
+        # 재개하자마자 예산 초과로 끝나면 일시정지를 쓸 수 없다.
+        if root.deadline is not None and \
+                time.time() - PAUSE.total > root.deadline:
             raise BudgetExceeded(
                 u"실행 시간이 상한 %.0f초를 넘었습니다 (노드 %s)."
                 % (root.max_seconds, node_id))
@@ -1099,8 +1609,10 @@ class GraphEngine(Engine):
         target = self.graph.target(node_id, graph_model.FAIL_PIN)
         if target:
             self.log(u"    실패 -> 실패 경로로 진행")
+            self._forget_failure()
             return target
         if node.get("onFail") == "continue":
+            self._forget_failure()
             carry = self.graph.target(node_id,
                                       graph_model.skip_pin(node.get("type")))
             if carry:
@@ -1109,13 +1621,18 @@ class GraphEngine(Engine):
             self.log(u"    실패했지만 계속 진행 - 이어진 노드가 없어 여기서 끝")
             return END_OF_CHAIN
         self.log(u"    실패 - 매크로 중단")
+        self._note_failure(node_id)
         return None
 
-    def _run_chain(self, node_id, depth):
+    def _run_chain(self, node_id, depth, resume=None):
         """실행 링크를 따라 체인을 실행한다.
 
         연결이 끊긴 지점에서 자연히 끝나고, 그때 호출자(루프 또는 최상위)로
         돌아간다. 블루프린트의 실행 핀과 같은 동작이다.
+
+        `resume` 은 이어서 실행할 때만 준다. 머리가 시작 노드를 가리키는
+        복원 경로이고, 그 노드가 반복이나 호출이면 그 **안쪽**으로 마저
+        내려간다. 한 번 쓰고 버린다 - 그 뒤로는 평범하게 흐른다.
         """
         guard = 0
         while node_id:
@@ -1124,8 +1641,13 @@ class GraphEngine(Engine):
                 self.log(u"!! 연결된 노드를 찾을 수 없습니다: %s" % node_id)
                 return ABORT
 
+            step, inner = self._consume_resume(resume, node_id)
+            resume = None
+
+            self._pause_point(node)
             self._spend(node_id)
             guard += 1
+            self._watch_node_start()
 
             ntype = node.get("type")
 
@@ -1146,7 +1668,7 @@ class GraphEngine(Engine):
                 result = False
                 try:
                     result = self.evaluate(node["condition"])
-                except MacroError:
+                except (MacroError, BudgetExceeded):
                     raise
                 except (Exception, Throwable), e:
                     self.log(u"    오류 %s: %s" % (e.__class__.__name__, e))
@@ -1164,7 +1686,11 @@ class GraphEngine(Engine):
                 continue
 
             if ntype == "repeat":
-                status = self._run_loop(node, depth)
+                status = self._run_loop(
+                    node, depth,
+                    resume=(step, inner) if step is not None
+                                            and step.get("enter") == "loop"
+                                         else None)
                 if status == BREAK:
                     return BREAK
                 if status == ABORT:
@@ -1178,7 +1704,11 @@ class GraphEngine(Engine):
                 continue
 
             if ntype == "call":
-                if not self._run_call(node):
+                if not self._run_call(
+                        node,
+                        resume=inner if step is not None
+                                        and step.get("enter") == "call"
+                                     else None):
                     node_id = self._on_failure(node_id, node)
                     if node_id is None:
                         return ABORT
@@ -1199,7 +1729,7 @@ class GraphEngine(Engine):
 
         return NORMAL
 
-    def _run_call(self, node):
+    def _run_call(self, node, resume=None):
         """다른 매크로를 함수처럼 호출한다.
 
         호출된 매크로는 자기 폴더를 기준으로 이미지를 찾고 자기 설정을 쓴다.
@@ -1291,16 +1821,36 @@ class GraphEngine(Engine):
                      % u", ".join(u"%s=%s" % (k, self._param_text(bound[k]))
                                   for k in sorted(bound.keys())))
 
+        # 호출된 매크로의 감시는 그 매크로가 도는 동안만 바깥 감시 뒤에 붙는다.
+        watching = False
+        if self.watch is not None and graph_model.handler_refs(data):
+            try:
+                self.watch.push(self, data, sub_dir, path)
+            except MacroError, e:
+                self.log(u"    감시를 걸 수 없습니다: %s" % e)
+                stack.pop()
+                return self._call_failed(node)
+            watching = True
+
+        spot = self._here(node.get("id"), "call", ref=ref)
+        self.root.frames.append(spot)
         try:
             if graph_model.is_graph(data):
                 sub = GraphEngine(data, sub_dir, sub_logger,
                                   root=self.root, call_stack=stack,
-                                  params=bound)
+                                  params=bound, resume_path=resume)
             else:
+                if resume:
+                    self.log(u"    트리 형식 매크로는 중간부터 이어서 할 수 "
+                             u"없습니다. 처음부터 돕니다")
                 sub = Engine(data, sub_dir, sub_logger, params=bound)
+            sub.watch = self.watch
             ok = sub.run()
         finally:
+            self.root.frames.pop()
             stack.pop()
+            if watching:
+                self.watch.pop(self)
 
         self.stats["failed"] += sub.stats.get("failed", 0)
         if not ok:
@@ -1314,8 +1864,18 @@ class GraphEngine(Engine):
         self.stats["failed"] += 1
         return False
 
-    def _run_loop(self, node, depth):
+    def _body(self, body_start, depth, inner):
+        """반복 본문 한 회차. `inner` 가 있으면 그 안쪽부터 이어서 한다."""
+        if inner:
+            return self._run_chain(inner[0]["node"], depth + 1, resume=inner)
+        return self._run_chain(body_start, depth + 1)
+
+    def _run_loop(self, node, depth, resume=None):
         body_start = self.graph.target(node.get("id"), "body")
+        frame, inner = resume if resume else (None, None)
+        # 이어서 하는 경우 이미 끝낸 횟수부터 시작한다. 진행 중이던 회차는
+        # 처음부터 다시 도는데, 그 회차가 어디까지 갔는지는 inner 가 안다.
+        resume_from = int(frame.get("done", 0)) if frame else 0
 
         # 반복 방식은 times / while / forEach 셋 중 하나뿐이다. 둘 이상 있으면
         # 어느 쪽이 뜻인지 알 수 없다. 예전에는 times 가 조용히 이겨서, 조건을
@@ -1329,7 +1889,8 @@ class GraphEngine(Engine):
 
         spec = graph_model.foreach_spec(node)
         if spec is not None:
-            return self._run_foreach(node, spec, body_start, depth)
+            return self._run_foreach(node, spec, body_start, depth,
+                                     resume_from, inner)
 
         if "times" in node:
             count = int(node["times"])
@@ -1337,14 +1898,24 @@ class GraphEngine(Engine):
                 raise MacroError(u"반복 횟수 %d가 상한 %d를 넘습니다"
                                  % (count, HARD_ITERATION_CAP))
             self._log_entry(node, u" (%d회)" % count)
-            for i in range(count):
-                self.log(u"    %d/%d" % (i + 1, count))
-                status = self._run_chain(body_start, depth + 1)
-                if status == ABORT:
-                    return ABORT
-                if status == BREAK:
-                    self.log(u"    break")
-                    return NORMAL
+            if resume_from:
+                self.log(u"    %d회까지는 끝난 것으로 보고 이어서 합니다"
+                         % resume_from)
+            spot = self._here(node.get("id"), "loop", mode="times", done=0)
+            self.root.frames.append(spot)
+            try:
+                for i in range(resume_from, count):
+                    spot["done"] = i
+                    self.log(u"    %d/%d" % (i + 1, count))
+                    status = self._body(body_start, depth, inner)
+                    inner = None
+                    if status == ABORT:
+                        return ABORT
+                    if status == BREAK:
+                        self.log(u"    break")
+                        return NORMAL
+            finally:
+                self.root.frames.pop()
             return NORMAL
 
         if "while" in node:
@@ -1356,26 +1927,39 @@ class GraphEngine(Engine):
                 raise MacroError(u"maxIterations %d가 상한 %d를 넘습니다"
                                  % (limit, HARD_ITERATION_CAP))
             self._log_entry(node, u" (조건 반복, 최대 %d)" % limit)
-            i = 0
-            while i < limit:
-                if not self.evaluate(node["while"]):
-                    self.log(u"    조건 거짓, %d회 후 종료" % i)
-                    return NORMAL
-                i += 1
-                self.log(u"    %d (최대 %d)" % (i, limit))
-                status = self._run_chain(body_start, depth + 1)
-                if status == ABORT:
-                    return ABORT
-                if status == BREAK:
-                    self.log(u"    break")
-                    return NORMAL
+            if resume_from:
+                self.log(u"    %d회 돈 상태에서 이어서 합니다 (조건은 다시 봅니다)"
+                         % resume_from)
+            spot = self._here(node.get("id"), "loop", mode="while", done=0)
+            self.root.frames.append(spot)
+            try:
+                i = resume_from
+                while i < limit:
+                    spot["done"] = i
+                    # 이어서 하는 첫 회차는 조건을 다시 묻지 않는다. 아까
+                    # 참이어서 들어갔던 회차를 마저 하는 것이기 때문이다.
+                    if inner is None and not self.evaluate(node["while"]):
+                        self.log(u"    조건 거짓, %d회 후 종료" % i)
+                        return NORMAL
+                    i += 1
+                    self.log(u"    %d (최대 %d)" % (i, limit))
+                    status = self._body(body_start, depth, inner)
+                    inner = None
+                    if status == ABORT:
+                        return ABORT
+                    if status == BREAK:
+                        self.log(u"    break")
+                        return NORMAL
+            finally:
+                self.root.frames.pop()
             self.log(u"    최대 반복 도달 (%d)" % limit)
             return NORMAL
 
         raise MacroError(u"노드 %s: times / while / forEach 중 하나가 필요합니다"
                          % node.get("id"))
 
-    def _run_foreach(self, node, spec, body_start, depth):
+    def _run_foreach(self, node, spec, body_start, depth,
+                     resume_from=0, inner=None):
         """값 목록을 하나씩 변수에 넣으며 본문을 돈다.
 
         반복 변수는 **본문 안에서만** 산다. 끝나면 이전 값으로 되돌려서,
@@ -1396,26 +1980,252 @@ class GraphEngine(Engine):
         self._log_entry(node, u" (%s = %s)" % (
             name, u", ".join(self._param_text(v) for v in values)))
 
+        if resume_from:
+            self.log(u"    %d개까지는 끝난 것으로 보고 이어서 합니다" % resume_from)
         had = name in self.params
         previous = self.params.get(name)
+        spot = self._here(node.get("id"), "loop", mode="forEach", done=0)
+        self.root.frames.append(spot)
         try:
-            for index, value in enumerate(values):
+            for index in range(resume_from, len(values)):
+                value = values[index]
+                spot["done"] = index
                 self.params[name] = value
                 self.log(u"    %d/%d  %s = %s" % (
                     index + 1, len(values), name, self._param_text(value)))
-                status = self._run_chain(body_start, depth + 1)
+                status = self._body(body_start, depth, inner)
+                inner = None
                 if status == ABORT:
                     return ABORT
                 if status == BREAK:
                     self.log(u"    break")
                     return NORMAL
         finally:
+            self.root.frames.pop()
             if had:
                 self.params[name] = previous
             else:
                 self.params.pop(name, None)
         return NORMAL
 
+
+# ------------------------------------------------------------- 감시 매크로
+
+# 감시 조건에서 화면을 읽는 종류. 확인할 때 기다리지 않도록 제한시간을 0으로 둔다.
+_SCREEN_CONDITIONS = ("imageExists", "imageMissing", "textExists", "textMissing")
+
+
+def _instant(cond):
+    """감시 조건의 사본. 화면을 읽는 조건은 기다리지 않고 한 번만 본다.
+
+    조건 노드의 기본 제한시간(3초)을 그대로 쓰면 감시 한 바퀴마다 메인이
+    몇 초씩 멈춘다. 감시는 '지금 떠 있는가' 만 묻는다.
+    """
+    copy = dict(cond)
+    if copy.get("type") in _SCREEN_CONDITIONS:
+        copy["timeout"] = 0
+    if isinstance(copy.get("condition"), dict):
+        copy["condition"] = _instant(copy["condition"])
+    if isinstance(copy.get("conditions"), list):
+        copy["conditions"] = [_instant(c) for c in copy["conditions"]]
+    return copy
+
+
+class _Handler(object):
+    """걸려 있는 감시 매크로 하나."""
+
+    def __init__(self, ref, key, macro, base_dir, owner):
+        self.ref = ref
+        self.key = key              # macro.json 절대 경로 (normcase)
+        self.macro = macro          # 하위 매크로면 부모 설정을 물려받은 사본
+        self.base_dir = base_dir    # 이미지를 찾을 폴더
+        self.owner = owner          # 이 감시를 건 매크로 이름 (로그용)
+        self.name = macro.get("name") or ref
+        self.condition = _instant(graph_model.watch_condition(macro))
+        # 조건 확인 전용 엔진. 로그를 남기지 않는다 - 매 바퀴 "없음" 이
+        # 찍히면 실행 로그가 감시로 뒤덮인다.
+        self.probe = Engine(macro, base_dir, logger=lambda _m: None)
+        # 메인이 나아가지 못하는 동안 연달아 걸린 횟수
+        self.streak = 0
+        self.fired_at = None
+        self.warned = False
+
+
+class WatchManager(object):
+    """감시 매크로 목록과 확인 주기를 갖는다. 실행 전체에 하나 (루트 엔진 소유).
+
+    목록은 호출 단계마다 한 겹씩 쌓인다 (`scopes`). 최상위 매크로의 겹이
+    실행 내내 걸리는 전역 감시이고, 호출/하위 매크로의 겹은 그 매크로가
+    끝나면 걷힌다. 한 바퀴는 바깥 겹부터 안쪽 겹 순서로 확인한다.
+
+    별도 스레드로 돌지 않는다. 메인이 노드 사이와 대기 중에 tick() 을
+    부를 때만 확인한다 - 입력 장치가 하나뿐이라 동시에 돌면 입력이 섞인다.
+    """
+
+    def __init__(self, root, interval):
+        self.root = root
+        self.interval = float(interval)
+        self.scopes = []
+        self.busy = False           # 감시를 처리하는 중 (다시 들어가지 않는다)
+        self.held = set()           # mouseDown 으로 누른 채인 버튼
+        self.progress = 0           # 메인이 시작한 노드 수
+        self.last_round = None      # 마지막 바퀴가 끝난 시각
+
+    def active(self):
+        for scope in self.scopes:
+            if scope:
+                return True
+        return False
+
+    def handlers(self):
+        out = []
+        for scope in self.scopes:
+            out.extend(scope)
+        return out
+
+    def push(self, engine, macro, base_dir, macro_path):
+        """macro 가 건 감시를 한 겹 쌓는다. 걸 수 없으면 MacroError.
+
+        이미 바깥 겹에 걸린 감시는 다시 걸지 않는다 - 바깥 자리에서 한 번만
+        확인한다.
+        """
+        errors, _warnings = graph_model.check_handler_refs(
+            macro, base_dir, macro_path)
+        if errors:
+            raise MacroError(u"; ".join(errors))
+        owner = macro.get("name") or u"?"
+        known = set(h.key for h in self.handlers())
+        added = []
+        for ref in graph_model.handler_refs(macro):
+            path = graph_model.resolve_macro_ref(ref, base_dir)
+            key = os.path.normcase(os.path.abspath(path))
+            if key in known:
+                continue
+            known.add(key)
+            added.append(self._load(ref, path, key, owner))
+        self.scopes.append(added)
+        # 감시 매크로의 엔진을 만들면서 글자 인식 설정이 바뀌었을 수 있다
+        engine._reapply_ocr()
+        if added:
+            engine.log(u"감시 시작 (%s): %s" % (
+                owner, u", ".join(h.name for h in added)))
+
+    def pop(self, engine):
+        scope = self.scopes.pop()
+        if scope:
+            engine.log(u"감시 끝 (%s): %s" % (
+                scope[0].owner, u", ".join(h.name for h in scope)))
+
+    @staticmethod
+    def _load(ref, path, key, owner):
+        try:
+            handle = open(path, "rb")
+            try:
+                data = json.loads(handle.read().decode("utf-8"))
+            finally:
+                handle.close()
+        except (Exception, Throwable), e:
+            raise MacroError(u"감시 매크로를 읽지 못했습니다: %s: %s" % (ref, e))
+        # 하위 매크로면 호출될 때와 같이 부모의 설정과 이미지 폴더를 쓴다
+        data, folder, _parent = _adopt_parent_context(
+            data, os.path.dirname(os.path.abspath(path)))
+        return _Handler(ref, key, data, folder, owner)
+
+    # ------------------------------------------------------------------ 확인
+
+    def tick(self, engine):
+        """확인할 때가 됐으면 한 바퀴 돈다.
+
+        반환값은 감시를 **처리하는 데** 쓴 시간(초)이다. 아무것도 걸리지
+        않은 바퀴는 0 을 준다 - 확인만 하는 시간은 짧고, 그걸 빼 주면 대기
+        노드의 '멈춤 확인' 처럼 시간을 재는 쪽이 매 바퀴 처음부터 다시 잰다.
+        """
+        if self.busy or self.held or not self.active():
+            return 0.0
+        now = time.time()
+        if self.last_round is not None and now - self.last_round < self.interval:
+            return 0.0
+
+        self.busy = True
+        fired = 0
+        try:
+            for handler in self.handlers():
+                if self._seen(handler, engine):
+                    fired += 1
+                    self._fire(handler, engine)
+        finally:
+            self.busy = False
+            self.last_round = time.time()
+        if not fired:
+            return 0.0
+        engine._reapply_ocr()
+        spent = self.last_round - now
+        engine.log(u"    [감시] 처리에 %.1f초 - 그동안 메인의 시계는 멈춰 "
+                   u"있었습니다 (대기 중이던 노드는 그만큼 더 기다립니다)" % spent)
+        return spent
+
+    @staticmethod
+    def _seen(handler, engine):
+        try:
+            return bool(handler.probe.evaluate(handler.condition))
+        except MacroError, e:
+            raise MacroError(u"감시 매크로 '%s' 의 조건 오류: %s"
+                             % (handler.name, e))
+        except BudgetExceeded:
+            raise
+        except (Exception, Throwable), e:
+            # 화면을 한 번 못 읽었다고 실행을 멈추지는 않는다. 다음 바퀴에 다시 본다.
+            # 알리기는 처음 한 번만 - 매 바퀴 찍히면 로그가 이것으로 뒤덮인다.
+            if not handler.warned:
+                handler.warned = True
+                engine.log(u"    [감시] '%s' 조건을 확인하지 못했습니다 (같은 "
+                           u"오류는 다시 알리지 않습니다): %s: %s"
+                           % (handler.name, e.__class__.__name__, e))
+            return False
+
+    def _fire(self, handler, engine):
+        if handler.fired_at == self.progress:
+            handler.streak += 1
+        else:
+            handler.streak = 1
+        handler.fired_at = self.progress
+        if handler.streak > graph_model.HANDLER_REPEAT_LIMIT:
+            raise WatchStuck(
+                u"감시 '%s' 가 메인이 한 노드도 나아가지 못하는 동안 %d번 "
+                u"연달아 걸렸습니다. 처리 동작이 대상을 없애지 못하는 것 "
+                u"같습니다 (감시 매크로의 동작과 감시 조건을 확인하세요)"
+                % (handler.name, graph_model.HANDLER_REPEAT_LIMIT))
+
+        engine.log(u"!! 감시 '%s' 걸림 (%s 의 감시) - 메인을 멈추고 처리합니다"
+                   % (handler.name, handler.owner))
+
+        def body_logger(message):
+            engine.log(u"    [감시] | %s" % message)
+
+        params, _notes = _standalone_params(handler.macro)
+        root = self.root
+        # 감시 처리 중의 실패는 메인의 '실패한 위치' 가 아니다. 남기면 이어서
+        # 실행이 감시 매크로 안으로 들어가려 한다.
+        saved = (root.failed_at, root.failed_name)
+        try:
+            if graph_model.is_graph(handler.macro):
+                # 예산은 메인과 함께 쓴다 (root 공유). 호출 사슬은 따로 둔다 -
+                # 메인이 지나고 있는 매크로를 감시가 불러도 순환이 아니다.
+                body = GraphEngine(handler.macro, handler.base_dir, body_logger,
+                                   root=root, call_stack=[handler.key],
+                                   params=params)
+            else:
+                body = Engine(handler.macro, handler.base_dir, body_logger,
+                              params=params)
+            body.watch = None
+            ok = body.run()
+        finally:
+            root.failed_at, root.failed_name = saved
+        if ok:
+            engine.log(u"!! 감시 '%s' 처리 끝 - 메인을 이어 갑니다" % handler.name)
+        else:
+            engine.log(u"!! 감시 '%s' 처리가 실패했습니다. 메인은 그대로 "
+                       u"이어 갑니다" % handler.name)
 
 
 def _adopt_parent_context(macro, base_dir):
@@ -1488,24 +2298,36 @@ def _standalone_params(macro):
     return values, notes
 
 
-def make_engine(macro, base_dir, logger=None, start_node=None, params=None):
+def make_engine(macro, base_dir, logger=None, start_node=None, params=None,
+                resume_path=None, macro_path=None):
     """형식을 보고 트리/그래프 실행기를 고른다.
 
     `start_node` 는 이번 실행만 그 노드에서 시작하게 한다. 노드라는 개념이
     없는 트리 형식에는 쓸 수 없다.
 
     `params` 를 주지 않으면 선언된 기본값으로 채운다 (_standalone_params).
+
+    `resume_path` 를 주면 저장해 둔 위치부터 이어서 실행한다.
     """
+    original = os.path.abspath(os.path.join(base_dir, "macro.json"))
     macro, base_dir, adopted = _adopt_parent_context(macro, base_dir)
     notes = []
     if params is None:
         params, notes = _standalone_params(macro)
     if graph_model.is_graph(macro):
         engine = GraphEngine(macro, base_dir, logger, start_node=start_node,
-                             params=params)
+                             params=params, resume_path=resume_path)
+        engine.macro_path = macro_path or original
+        if adopted:
+            parent_path = os.path.join(adopted, "macro.json")
+            parent = graph_model.read_macro_file(parent_path)
+            if parent is not None and graph_model.handler_refs(parent):
+                engine.inherited_handlers = (parent, adopted, parent_path)
     else:
         if start_node:
             raise MacroError("start node is only supported for graph macros")
+        if resume_path:
+            raise MacroError("resume is only supported for graph macros")
         engine = Engine(macro, base_dir, logger, params=params)
     if adopted:
         engine.log(u"하위 매크로 - 부모(%s)의 설정과 이미지 폴더를 사용합니다"

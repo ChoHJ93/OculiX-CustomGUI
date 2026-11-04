@@ -64,6 +64,11 @@ _CLICK_FIELDS = [
     {"name": "similarity", "type": "float", "label": u"정확도"},
     {"name": "timeout", "type": "float", "label": u"제한시간(초)"},
     {"name": "region", "type": "region", "label": u"검색 영역"},
+    {"name": "settleFor", "type": "float", "label": u"멈춤 확인(초)",
+     "help": u"찾은 자리가 이만큼 멈춰 있어야 누른다. 스크롤이 끝나기 전에 "
+             u"집으면 마우스가 도착할 때쯤 목록이 밀려서 **바로 옆 항목**을 "
+             u"누르게 된다. 같은 모양 버튼이 세로로 늘어선 목록이라면 0.4 "
+             u"정도부터. 비우면 매크로 기본값(보통 끔)"},
 ]
 
 

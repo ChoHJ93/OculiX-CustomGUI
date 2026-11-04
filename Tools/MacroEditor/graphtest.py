@@ -1638,6 +1638,595 @@ check(u"충돌한 반복은 실행되지 않음", _code != 0, u"exit=%s" % _code
 
 
 
+section(u"31. 실패한 노드부터 이어서 실행 (여러 겹 반복 상태 복원)")
+
+RESUME_FILE = os.path.join(PROJECT, "Logs", "resume.json")
+
+
+def read_resume():
+    if not os.path.exists(RESUME_FILE):
+        return None
+    with io.open(RESUME_FILE, encoding="utf-8-sig") as fh:
+        return json.loads(fh.read())
+
+
+def clear_resume():
+    if os.path.exists(RESUME_FILE):
+        os.remove(RESUME_FILE)
+
+
+def run_resume(path):
+    """--resume 으로 이어서 실행한다."""
+    cmd = [JAVA, "-Dfile.encoding=UTF-8", "-Dsun.stdout.encoding=UTF-8",
+           "-jar", JAR, "-r", RUNNER, "-c", "--", path, "--resume"]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    text = proc.stdout.decode("utf-8", "replace")
+    lines = [l for l in text.splitlines() if "[DEBUG STARTUP]" not in l]
+    return proc.returncode, lines, "\n".join(lines)
+
+
+def flag_node(g, flag, x=0, y=0, create=False):
+    """플래그 파일이 있으면 성공, 없으면 실패하는 노드.
+
+    create=True 면 처음 실패하면서 플래그를 만든다 - 같은 노드를 다시 하면
+    성공한다. 화면 없이 "실패 -> 다시 하니 성공" 을 재현하려는 것이다.
+    """
+    tail = (["(type", "nul", ">", flag, "&", "exit", "1)"] if create
+            else ["(exit", "1)"])
+    return g.add_node({"type": "run", "command": "cmd", "useShell": False,
+                       "waitForExit": True, "timeout": 10,
+                       "args": ["/c", "if", "exist", flag, "(exit", "0)",
+                                "else"] + tail}, x, y)
+
+
+FLAGS = os.path.join(WORK, "flags")
+if not os.path.isdir(FLAGS):
+    os.makedirs(FLAGS)
+
+
+def flag_path(name):
+    path = os.path.join(FLAGS, name)
+    if os.path.exists(path):
+        os.remove(path)
+    return path
+
+
+# --- 부모 반복 > 하위 매크로 호출 > 그 안의 반복 > 실패한 노드
+#     두 겹 반복의 회차(n=2, m=2)를 모두 기억했다가 그 노드부터 이어서 한다.
+clear_resume()
+_flag1 = flag_path("nested.flag")
+
+_sub = graph_model.Graph(graph_model.blank(u"안쪽 반복"))
+_sub.data["params"] = [{"name": "n", "type": "int", "default": 0}]
+_s0 = log_node(_sub, "SUB")
+_sl = _sub.add_node({"type": "repeat", "forEach": {
+    "param": "m", "type": "int", "values": [1, 2, 3]}}, 240, 0)
+_sm = log_node(_sub, "M", 480, 0)
+_si1 = _sub.add_node({"type": "if", "condition": {
+    "type": "paramCompare", "param": "n", "op": "==", "value": "2"}}, 720, 0)
+_si2 = _sub.add_node({"type": "if", "condition": {
+    "type": "paramCompare", "param": "m", "op": "==", "value": "2"}}, 960, 0)
+_sf = flag_node(_sub, _flag1, 1200, 0)
+_sf["label"] = u"까다로운 단계"
+_sub.entry = _s0["id"]
+_sub.connect(_s0["id"], "next", _sl["id"])
+_sub.connect(_sl["id"], "body", _sm["id"])
+_sub.connect(_sm["id"], "next", _si1["id"])
+_sub.connect(_si1["id"], "true", _si2["id"])
+_sub.connect(_si2["id"], "true", _sf["id"])
+save_named(_sub, os.path.join("ResumeNest", "Inner"))
+
+_top = graph_model.Graph(graph_model.blank(u"바깥 반복"))
+_t0 = log_node(_top, "START")
+_tl = _top.add_node({"type": "repeat", "forEach": {
+    "param": "n", "type": "int", "values": [1, 2, 3]}}, 240, 0)
+_tc = _top.add_node({"type": "call", "macro": "./Inner",
+                     "args": {"n": graph_model.param_ref("n")}}, 480, 0)
+_te = log_node(_top, "END", 240, 200)
+_top.entry = _t0["id"]
+_top.connect(_t0["id"], "next", _tl["id"])
+_top.connect(_tl["id"], "body", _tc["id"])
+_top.connect(_tl["id"], "completed", _te["id"])
+_nest_path = save_named(_top, "ResumeNest")
+
+_code, _lines, _text = run_graph_path(_nest_path)
+check(u"두 번째 바깥 회차의 두 번째 안쪽 회차에서 실패한다",
+      _code == 1 and marks(_lines) == ["START", "SUB", "M", "M", "M",
+                                       "SUB", "M", "M"],
+      u"%r" % (marks(_lines),))
+_saved = read_resume()
+_frames = (_saved or {}).get("failedAt") or []
+check(u"실패 위치가 남는다", bool(_frames), u"%r" % (_saved,))
+check(u"경로가 [바깥 반복, 호출, 안쪽 반복, 실패 노드] 네 칸이다",
+      [f.get("enter") for f in _frames] == ["loop", "call", "loop", None],
+      u"%r" % (_frames,))
+check(u"바깥 반복은 2회째 (n=2) 로 남는다",
+      len(_frames) == 4 and _frames[0].get("done") == 1, u"%r" % (_frames,))
+check(u"안쪽 반복도 2회째 (m=2) 로 남는다",
+      len(_frames) == 4 and _frames[2].get("done") == 1, u"%r" % (_frames,))
+check(u"마지막 칸은 실패한 노드 자체다",
+      len(_frames) == 4 and _frames[3].get("node") == _sf["id"],
+      u"%r" % (_frames,))
+check(u"실패한 노드 이름을 남긴다",
+      (_saved or {}).get("failedName") == u"까다로운 단계",
+      u"%r" % ((_saved or {}).get("failedName"),))
+check(u"각 칸에 그 칸 매크로의 이름이 들어간다",
+      len(_frames) == 4 and _frames[0].get("macro") == u"바깥 반복"
+      and _frames[2].get("macro") == u"안쪽 반복", u"%r" % (_frames,))
+
+# 문제가 풀렸다 (플래그 생김) -> 이어서 실행
+io.open(_flag1, "w").close()
+_code, _lines, _text = run_resume(_nest_path)
+check(u"이어서 하면 성공으로 끝난다", _code == 0, u"exit=%s" % _code)
+check(u"실패한 노드부터 이어서 하고 남은 회차를 마저 돈다",
+      marks(_lines) == ["M", "SUB", "M", "M", "M", "END"],
+      u"%r" % (marks(_lines),))
+check(u"바깥 반복은 n=2 부터 이어 간다",
+      u"2/3  n = 2" in _text and u"1/3  n = 1" not in _text)
+check(u"안쪽 반복은 m=2 부터 이어 간다", u"2/3  m = 2" in _text)
+check(u"실패한 노드를 먼저 다시 한다",
+      u"정상 종료 (코드 0)" in _text
+      and _text.find(u"정상 종료 (코드 0)") < _text.find(u"MARK:M"))
+check(u"어디부터 이어서 하는지 알린다", u"이어서 실행:" in _text)
+check(u"성공하면 '이어서 실행' 기록을 새로 남기지 않는다",
+      u"이어서 실행할 수 있습니다" not in _text)
+check(u"성공하면 낡은 기록을 지운다 (버튼이 켜진 채 남지 않게)",
+      read_resume() is None, u"%r" % (read_resume(),))
+
+# --- 실패하면 그 자리에서 끝난다. 자동으로 다시 하지 않는다 - 이어서 실행은
+#     사람이 화면을 확인한 뒤 직접 한다. 다시 하면 성공할 노드로 시험해야
+#     "다시 해 봤는지" 가 드러난다. 예전 매크로에 남은 autoRetry 값도 무시한다.
+clear_resume()
+_flag2 = flag_path("retry.flag")
+_g = graph_model.Graph(graph_model.blank(u"한 번만"))
+_g.data["settings"]["autoRetry"] = 2
+_a = log_node(_g, "START")
+_lp = _g.add_node({"type": "repeat", "times": 3}, 240, 0)
+_b = log_node(_g, "B", 480, 0)
+_f = flag_node(_g, _flag2, 720, 0, create=True)
+_e = log_node(_g, "END", 240, 200)
+_g.entry = _a["id"]
+_g.connect(_a["id"], "next", _lp["id"])
+_g.connect(_lp["id"], "body", _b["id"])
+_g.connect(_b["id"], "next", _f["id"])
+_g.connect(_lp["id"], "completed", _e["id"])
+_noretry_path = save_graph(_g, "ResumeNoRetry")
+_code, _lines, _text = run_graph_path(_noretry_path)
+check(u"실패하면 자동으로 다시 하지 않고 끝난다",
+      _code == 1 and marks(_lines) == ["START", "B"],
+      u"exit=%s %r" % (_code, marks(_lines)))
+check(u"실패한 노드를 한 번만 해 본다", _text.count(u"종료 코드 1") == 1,
+      u"%d번" % _text.count(u"종료 코드 1"))
+check(u"autoRetry 값이 남아 있어도 재시도 문구가 없다",
+      u"부터 다시 합니다" not in _text and u"재시도" not in _text)
+_saved = read_resume()
+_frames = (_saved or {}).get("failedAt") or []
+check(u"실패 위치(반복 1회째, 실패 노드)를 남긴다",
+      [f.get("enter") for f in _frames] == ["loop", None]
+      and _frames[0].get("done") == 0 and _frames[1].get("node") == _f["id"],
+      u"%r" % (_frames,))
+
+# 사람이 확인한 뒤 이어서 실행하면 그 노드부터 남은 회차를 마저 돈다
+_code, _lines, _text = run_resume(_noretry_path)
+check(u"이어서 실행은 사람이 부를 때만 - 부르면 끝까지 간다", _code == 0,
+      u"exit=%s" % _code)
+check(u"이어서 실행은 실패한 노드부터 남은 회차를 돈다",
+      marks(_lines) == ["B", "B", "END"], u"%r" % (marks(_lines),))
+
+# --- 실패 핀으로 복구한 실패는 기록에 남지 않는다. 남으면 그 뒤의 진짜
+#     실패 위치를 가린다 (가장 안쪽 하나만 남기는 규칙 때문).
+clear_resume()
+_flag4 = flag_path("recover.flag")
+_flag5 = flag_path("later.flag")
+_inner = graph_model.Graph(graph_model.blank(u"복구될 하위"))
+_ia = flag_node(_inner, _flag4)
+_inner.entry = _ia["id"]
+save_named(_inner, os.path.join("ResumeRecover", "Fails"))
+_outer = graph_model.Graph(graph_model.blank(u"복구하는 쪽"))
+_oc = _outer.add_node({"type": "call", "macro": "./Fails"}, 0, 0)
+_or = log_node(_outer, "RECOVER", 240, 100)
+_ol = flag_node(_outer, _flag5, 480, 100)
+_outer.entry = _oc["id"]
+_outer.connect(_oc["id"], graph_model.FAIL_PIN, _or["id"])
+_outer.connect(_or["id"], "next", _ol["id"])
+_recover_path = save_named(_outer, "ResumeRecover")
+_code, _lines, _text = run_graph_path(_recover_path)
+_saved = read_resume()
+_frames = (_saved or {}).get("failedAt") or []
+check(u"복구된 실패가 아니라 나중의 진짜 실패 위치를 남긴다",
+      len(_frames) == 1 and _frames[0].get("node") == _ol["id"],
+      u"%r" % (_frames,))
+
+# --- 다른 매크로의 기록 / 기록 없음은 거부
+#     (위에서 ResumeRecover 의 기록이 남아 있다)
+_code, _lines, _text = run_resume(_nest_path)
+check(u"다른 매크로의 기록은 거부한다",
+      _code == 2 and u"다른 매크로의 것" in _text, u"exit=%s" % _code)
+clear_resume()
+_code, _lines, _text = run_resume(_nest_path)
+check(u"기록이 없으면 거부한다", _code == 2, u"exit=%s" % _code)
+clear_resume()
+
+
+section(u"32. 감시 매크로 (handlers / watch)")
+
+# 화면 상태와 무관하게 결과가 정해지는 감시 조건을 쓴다.
+# never_matches.png 는 어디에도 없으므로 '없으면' 은 늘 참, '있으면' 은 늘 거짓.
+_NEVER = os.path.join(PROJECT, "Macros", "Example", "never_matches.png")
+W_ALWAYS = {"type": "imageMissing", "image": "never.png",
+            "region": [0, 0, 300, 300]}
+W_NEVER = {"type": "imageExists", "image": "never.png",
+           "region": [0, 0, 300, 300]}
+
+
+def save_watch_macro(folder, name, nodes, links=None, watch=None,
+                     handlers=None, settings=None):
+    """감시 시험용 매크로를 저장한다. 폴더마다 never.png 를 둔다."""
+    path = os.path.join(MACROS, folder)
+    if not os.path.isdir(path):
+        os.makedirs(path)
+    shutil.copyfile(_NEVER, os.path.join(path, "never.png"))
+    data = {"name": name, "version": 2, "format": "graph",
+            "entry": nodes[0]["id"], "nodes": nodes, "links": links or []}
+    if watch is not None:
+        data["watch"] = watch
+    if handlers is not None:
+        data["handlers"] = handlers
+    if settings is not None:
+        data["settings"] = settings
+    target = os.path.join(path, "macro.json")
+    with io.open(target, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(data, ensure_ascii=False, indent=2))
+    return target
+
+
+def mark_chain(prefix, names):
+    """MARK 로그 노드를 차례로 이은 (nodes, links)."""
+    nodes = [mark_node("%s%d" % (prefix, i), name)
+             for i, name in enumerate(names)]
+    links = [{"from": nodes[i]["id"], "pin": "next", "to": nodes[i + 1]["id"]}
+             for i in range(len(nodes) - 1)]
+    return nodes, links
+
+
+def stamp_seconds(line):
+    """'[HH:MM:SS] ...' 로그 줄의 시각을 초로. 없으면 None."""
+    at = line.find("[")
+    try:
+        h, m, s = line[at + 1:at + 9].split(":")
+        return int(h) * 3600 + int(m) * 60 + int(s)
+    except ValueError:
+        return None
+
+
+_nodes, _links = mark_chain("h", ["H"])
+save_watch_macro("WatchAlways", u"늘 걸리는 감시", _nodes, _links, watch=W_ALWAYS)
+_nodes, _links = mark_chain("h", ["NEVER"])
+save_watch_macro("WatchNever", u"안 걸리는 감시", _nodes, _links, watch=W_NEVER)
+_nodes, _links = mark_chain("h", ["PLAIN"])
+save_watch_macro("NotAWatch", u"감시 조건 없음", _nodes, _links)
+
+# --- 노드마다 확인한다 (간격 0) / 걸리지 않는 감시는 아무 흔적도 없다
+_nodes, _links = mark_chain("m", ["A", "B", "C"])
+_p = save_watch_macro("WatchEvery", u"매 노드 감시", _nodes, _links,
+                      handlers=["WatchAlways", "WatchNever"],
+                      settings={"handlerInterval": 0})
+_code, _lines, _text = run_graph_path(_p)
+check(u"감시가 노드마다 먼저 돈다 (간격 0)",
+      _code == 0 and marks(_lines) == ["H", "A", "H", "B", "H", "C"],
+      u"exit=%s %r" % (_code, marks(_lines)))
+check(u"걸리지 않는 감시는 동작하지 않는다", "NEVER" not in marks(_lines))
+check(u"걸리지 않는 감시는 확인 로그를 남기지 않는다",
+      u"never.png 없음" not in _text and u"never.png 발견" not in _text)
+
+# --- 간격이 길면 첫 바퀴 뒤로는 확인하지 않는다
+_nodes, _links = mark_chain("m", ["A", "B", "C"])
+_p = save_watch_macro("WatchSlow", u"느린 감시", _nodes, _links,
+                      handlers=["WatchAlways"],
+                      settings={"handlerInterval": 100})
+_code, _lines, _text = run_graph_path(_p)
+check(u"간격(handlerInterval) 안에서는 다시 확인하지 않는다",
+      marks(_lines) == ["H", "A", "B", "C"], u"%r" % (marks(_lines),))
+
+# --- 하위 매크로의 감시는 그 하위가 도는 동안만, 부모 감시 다음에 돈다.
+#     같은 감시를 하위가 또 걸어도 한 바퀴에 한 번만 확인한다.
+_nodes, _links = mark_chain("s", ["SW"])
+save_watch_macro(os.path.join("WatchFam", "SubWatch"), u"하위 감시",
+                 _nodes, _links, watch=W_ALWAYS)
+_nodes, _links = mark_chain("u", ["S1", "S2"])
+save_watch_macro(os.path.join("WatchFam", "Work"), u"하위 작업", _nodes, _links,
+                 handlers=["./SubWatch", "WatchAlways"])
+_fam = save_watch_macro(
+    "WatchFam", u"감시 가족",
+    [mark_node("p1", "P1"), {"id": "p2", "type": "call", "macro": "./Work"},
+     mark_node("p3", "P2")],
+    [{"from": "p1", "pin": "next", "to": "p2"},
+     {"from": "p2", "pin": "next", "to": "p3"}],
+    handlers=["WatchAlways"], settings={"handlerInterval": 0})
+_code, _lines, _text = run_graph_path(_fam)
+check(u"하위 감시는 부모 감시 다음에, 하위가 도는 동안만 돈다",
+      _code == 0 and marks(_lines) == ["H", "P1", "H", "H", "SW", "S1",
+                                       "H", "SW", "S2", "H", "P2"],
+      u"exit=%s %r" % (_code, marks(_lines)))
+check(u"하위가 끝나면 그 감시를 걷는다",
+      u"감시 끝 (하위 작업): 하위 감시" in _text)
+
+# 하위를 단독으로 돌려도 부모의 감시가 먼저 걸린다 (호출될 때와 같은 문맥)
+_code, _lines, _text = run_graph_path(
+    os.path.join(MACROS, "WatchFam", "Work", "macro.json"))
+check(u"하위 단독 실행에도 부모 감시가 먼저 걸린다",
+      _code == 0 and marks(_lines) == ["H", "SW", "S1", "H", "SW", "S2"],
+      u"exit=%s %r" % (_code, marks(_lines)))
+
+# --- 대기 중에도 감시가 돌고, 처리한 시간만큼 제한시간을 늘린다.
+#     감시 처리 2초, 대기 제한 3초, 간격 1초 -> 대기 중에 한 번 이상 걸려
+#     대기는 5초 넘게 걸린다. 빼 주지 않으면 3초 (+ 마지막 검색이 넘친 만큼).
+#     exists() 를 자른 한 조각이 0.5초보다 오래 걸려서 간격을 너무 길게
+#     잡으면 대기 중에는 한 번도 확인할 때가 오지 않는다.
+_slow = save_watch_macro(
+    "WatchSlowBody", u"오래 걸리는 감시",
+    [{"id": "w1", "type": "wait", "seconds": 2}, mark_node("w2", "SLOW")],
+    [{"from": "w1", "pin": "next", "to": "w2"}], watch=W_ALWAYS)
+_p = save_watch_macro(
+    "WatchWait", u"대기 중 감시",
+    [{"id": "a1", "type": "waitImage", "image": "never.png",
+      "region": [0, 0, 300, 300], "timeout": 3},
+     mark_node("a2", "TIMEOUT")],
+    [{"from": "a1", "pin": graph_model.FAIL_PIN, "to": "a2"}],
+    handlers=["WatchSlowBody"], settings={"handlerInterval": 1})
+_code, _lines, _text = run_graph_path(_p)
+_begin = [l for l in _lines if u"--> waitImage" in l]
+_end = [l for l in _lines if u"not found: never.png" in l]
+_span = (stamp_seconds(_end[0]) - stamp_seconds(_begin[0])
+         if _begin and _end else None)
+check(u"대기 중에도 감시가 돈다",
+      marks(_lines).count("SLOW") >= 2 and marks(_lines)[-1] == "TIMEOUT",
+      u"%r" % (marks(_lines),))
+check(u"감시 처리 시간은 대기 제한시간에서 뺀다 (3초 제한이 5초 이상)",
+      _span is not None and _span >= 5, u"대기 %s초" % _span)
+
+# --- 메인이 나아가지 못하는 동안 같은 감시가 계속 걸리면 멈춘다
+_p = save_watch_macro(
+    "WatchStuck", u"막히는 감시",
+    [{"id": "a1", "type": "waitImage", "image": "never.png",
+      "region": [0, 0, 300, 300], "timeout": 60}],
+    handlers=["WatchAlways"], settings={"handlerInterval": 0})
+_code, _lines, _text = run_graph_path(_p)
+check(u"닫기가 안 먹는 감시는 실행을 멈춘다",
+      _code == 1 and u"감시가 막혀 중단" in _text, u"exit=%s" % _code)
+check(u"멈추기 전까지 상한(%d)번 처리해 본다"
+      % graph_model.HANDLER_REPEAT_LIMIT,
+      marks(_lines).count("H") == graph_model.HANDLER_REPEAT_LIMIT,
+      u"%d번" % marks(_lines).count("H"))
+
+# --- 감시 처리가 실패해도 메인은 이어 가고, 실패 위치로 남지 않는다
+clear_resume()
+save_watch_macro("WatchFails", u"실패하는 감시",
+                 [{"id": "f1", "type": "waitImage", "image": "never.png",
+                   "region": [0, 0, 300, 300], "timeout": 0}],
+                 watch=W_ALWAYS)
+_nodes, _links = mark_chain("m", ["A", "B"])
+_p = save_watch_macro("WatchFailMain", u"실패 감시 메인", _nodes, _links,
+                      handlers=["WatchFails"], settings={"handlerInterval": 100})
+_code, _lines, _text = run_graph_path(_p)
+check(u"감시 처리가 실패해도 메인은 끝까지 간다",
+      _code == 0 and marks(_lines) == ["A", "B"]
+      and u"처리가 실패했습니다" in _text, u"exit=%s %r" % (_code, marks(_lines)))
+check(u"감시 안의 실패는 '이어서 실행' 위치로 남지 않는다",
+      read_resume() is None, u"%r" % (read_resume(),))
+
+# --- 잘못 건 감시는 실행 전에 거부한다
+_nodes, _links = mark_chain("m", ["A"])
+_p = save_watch_macro("WatchBadRef", u"잘못된 감시", _nodes, _links,
+                      handlers=["NotAWatch"])
+_code, _lines, _text = run_graph_path(_p)
+check(u"감시 조건 없는 매크로를 감시로 걸면 실행하지 않는다",
+      _code != 0 and u"감시 조건(watch)이 없습니다" in _text
+      and "A" not in marks(_lines), u"exit=%s" % _code)
+
+save_watch_macro("WatchBadCallee", u"없는 감시를 건 피호출", _nodes, _links,
+                 handlers=["NoSuchWatch"])
+_p = save_watch_macro(
+    "WatchBadCaller", u"호출하는 쪽",
+    [{"id": "c1", "type": "call", "macro": "WatchBadCallee"},
+     mark_node("c2", "RECOVER")],
+    [{"from": "c1", "pin": graph_model.FAIL_PIN, "to": "c2"}])
+_code, _lines, _text = run_graph_path(_p)
+check(u"호출된 매크로의 감시를 걸 수 없으면 그 호출이 실패한다",
+      u"감시를 걸 수 없습니다" in _text and marks(_lines) == ["RECOVER"],
+      u"%r" % (marks(_lines),))
+clear_resume()
+
+
+section(u"33. 일시정지 / 재개 (실제 실행을 멈췄다 풀어 본다)")
+
+# 편집기가 쓰는 runner.Job 을 그대로 쓴다. --pause-file 전달부터 신호 파일,
+# 로그 표식까지 실제 경로 전체를 지나가게 하려는 것이다.
+import time as _time
+sys.path.insert(0, HERE)
+import runner as editor_runner
+
+
+class LiveRun(object):
+    def __init__(self, path):
+        self.lines = []
+        self.done = []
+        self.job = editor_runner.run_macro(path, self.lines.append,
+                                           self.done.append)
+
+    def text(self):
+        return u"\n".join(list(self.lines))
+
+    def wait_for(self, needle, limit=60.0):
+        """그 글자가 찍힐 때까지 기다린다. 찍힌 시각을 준다. 못 보면 None."""
+        end = _time.time() + limit
+        while _time.time() < end:
+            if needle in self.text():
+                return _time.time()
+            if self.done:
+                return _time.time() if needle in self.text() else None
+            _time.sleep(0.05)
+        return None
+
+    def finish(self, limit=60.0):
+        end = _time.time() + limit
+        while not self.done and _time.time() < end:
+            _time.sleep(0.05)
+        if not self.done:
+            self.job.stop()
+        return self.done[0] if self.done else None
+
+
+def pause_macro(name, nodes, links=(), settings=None):
+    """log/wait 노드 목록으로 매크로를 만든다. nodes 는 (dict 또는 마크 글자)."""
+    g = graph_model.Graph(graph_model.blank(name))
+    if settings:
+        g.data["settings"].update(settings)
+    made = []
+    for i, spec in enumerate(nodes):
+        if isinstance(spec, dict):
+            made.append(g.add_node(dict(spec), 240 * i, 0))
+        else:
+            made.append(log_node(g, spec, 240 * i, 0))
+    g.entry = made[0]["id"]
+    for a, b in zip(made, made[1:]):
+        g.connect(a["id"], "next", b["id"])
+    return g, made
+
+
+# --- 첫 노드 앞에서 멈춘다. 멈춰 있는 동안 아무 노드도 실행되지 않는다.
+_g, _m = pause_macro(u"노드 앞", ["A", "B"])
+_run = LiveRun(save_graph(_g, "PauseNode"))
+_run.job.pause()
+check(u"일시정지 요청을 받아 멈춘다",
+      _run.wait_for(graph_model.PAUSED_MARK) is not None, _run.text()[-300:])
+check(u"어느 노드 앞에서 멈췄는지 알린다",
+      u"다음 노드 실행 전" in _run.text() and u"(n1)" in _run.text())
+_time.sleep(3.0)
+check(u"멈춰 있는 동안 노드가 실행되지 않는다", marks(_run.lines) == [],
+      u"%r" % (marks(_run.lines),))
+check(u"프로세스는 살아 있다 (강제 종료가 아니다)", not _run.done)
+_run.job.unpause()
+_code = _run.finish()
+check(u"재개하면 끝까지 간다",
+      _code == 0 and marks(_run.lines) == ["A", "B"],
+      u"exit=%s %r" % (_code, marks(_run.lines)))
+check(u"멈춰 있던 시간을 알린다",
+      graph_model.RESUMED_MARK in _run.text() and u"초 멈춰" in _run.text())
+check(u"끝나면 신호 파일이 남지 않는다",
+      not os.path.exists(editor_runner.PAUSE_FILE))
+
+# --- wait 노드 도중에 멈춘다. 빠르게 멈추고, 남은 시간을 마저 기다린다.
+_g, _m = pause_macro(u"대기 중", ["A", {"type": "wait", "seconds": 4}, "B"])
+_run = LiveRun(save_graph(_g, "PauseWait"))
+_t_a = _run.wait_for("MARK:A")
+_time.sleep(1.0)
+_t_req = _time.time()
+_run.job.pause()
+_t_stop = _run.wait_for(graph_model.PAUSED_MARK, 10)
+check(u"대기 중에는 1초 안에 멈춘다",
+      _t_stop is not None and _t_stop - _t_req < 1.0,
+      u"%.2f초" % ((_t_stop or 0) - _t_req))
+check(u"대기 중에 멈췄다고 알린다", u"대기 중" in _run.text())
+_time.sleep(3.0)
+_t_res = _time.time()
+_run.job.unpause()
+_t_b = _run.wait_for("MARK:B")
+_run.finish()
+_spent = (_t_b or 0) - _t_a
+check(u"멈춘 시간은 wait 시간으로 치지 않는다 (4초 + 멈춘 3초 이상)",
+      _spent >= 6.7, u"A~B %.1f초" % _spent)
+check(u"재개한 뒤 남은 시간을 마저 기다린다 (약 3초)",
+      2.0 <= (_t_b or 0) - _t_res <= 4.5,
+      u"재개 후 %.1f초" % ((_t_b or 0) - _t_res))
+
+# --- 이미지 대기의 제한시간보다 오래 멈춰도 곧바로 실패하지 않는다
+_g, _m = pause_macro(u"이미지 대기", [
+    "A", {"type": "waitImage", "image": "never_matches.png", "timeout": 3,
+          "onFail": "continue"}, "B"])
+_path = save_graph(_g, "PauseImage")
+shutil.copyfile(os.path.join(PROJECT, "Macros", "Example", "never_matches.png"),
+                os.path.join(os.path.dirname(_path), "never_matches.png"))
+_run = LiveRun(_path)
+_t_a = _run.wait_for("MARK:A")
+_time.sleep(0.5)
+_run.job.pause()
+_run.wait_for(graph_model.PAUSED_MARK, 10)
+_time.sleep(5.0)                      # 제한시간 3초보다 길게
+_t_res = _time.time()
+_run.job.unpause()
+_t_b = _run.wait_for("MARK:B")
+_run.finish()
+check(u"제한시간보다 오래 멈춰도 재개 후 남은 시간을 기다린다",
+      (_t_b or 0) - _t_res >= 1.5,
+      u"재개 후 %.1f초 뒤에야 넘어감" % ((_t_b or 0) - _t_res))
+
+# --- 예산보다 오래 멈춰도 예산 초과로 끝나지 않는다
+_g, _m = pause_macro(u"예산", ["A", {"type": "wait", "seconds": 1}, "B"],
+                     settings={"maxSeconds": 3})
+_run = LiveRun(save_graph(_g, "PauseBudget"))
+_run.wait_for("MARK:A")
+_run.job.pause()
+_run.wait_for(graph_model.PAUSED_MARK, 10)
+_time.sleep(4.5)                      # maxSeconds 3 보다 길게
+_run.job.unpause()
+_code = _run.finish()
+check(u"멈춘 시간은 실행 예산으로 치지 않는다",
+      _code == 0 and marks(_run.lines) == ["A", "B"]
+      and u"상한" not in _run.text(),
+      u"exit=%s %r" % (_code, marks(_run.lines)))
+
+# --- 반복 + 호출 안에서 멈췄다 풀어도 회차가 어긋나지 않는다
+_sub = graph_model.Graph(graph_model.blank(u"하위"))
+_c1 = log_node(_sub, "SUB")
+_c2 = _sub.add_node({"type": "wait", "seconds": 0.6}, 240, 0)
+_sub.entry = _c1["id"]
+_sub.connect(_c1["id"], "next", _c2["id"])
+save_named(_sub, os.path.join("PauseNest", "Inner"))
+_top = graph_model.Graph(graph_model.blank(u"바깥"))
+_l = _top.add_node({"type": "repeat", "times": 3}, 0, 0)
+_c = _top.add_node({"type": "call", "macro": "./Inner"}, 240, 0)
+_e = log_node(_top, "END", 0, 200)
+_top.entry = _l["id"]
+_top.connect(_l["id"], "body", _c["id"])
+_top.connect(_l["id"], "completed", _e["id"])
+_run = LiveRun(save_named(_top, "PauseNest"))
+_run.wait_for("MARK:SUB")
+_run.job.pause()
+_run.wait_for(graph_model.PAUSED_MARK, 10)
+_time.sleep(1.5)
+_run.job.unpause()
+_code = _run.finish()
+check(u"반복/호출 안에서 멈춰도 회차가 그대로 이어진다",
+      _code == 0 and marks(_run.lines) == ["SUB", "SUB", "SUB", "END"],
+      u"exit=%s %r" % (_code, marks(_run.lines)))
+
+# --- 멈춘 채로 중지할 수 있다
+_g, _m = pause_macro(u"멈춘 채 중지", ["A", "B"])
+_run = LiveRun(save_graph(_g, "PauseStop"))
+_run.job.pause()
+_run.wait_for(graph_model.PAUSED_MARK)
+_run.job.stop()
+_code = _run.finish(20)
+check(u"일시정지 중에 중지하면 프로세스가 끝난다",
+      _code is not None and marks(_run.lines) == [],
+      u"exit=%s %r" % (_code, marks(_run.lines)))
+check(u"중지한 뒤 신호 파일이 남지 않는다",
+      not os.path.exists(editor_runner.PAUSE_FILE))
+
+# --- 명령줄 실행은 신호 파일을 보지 않는다. 남은 파일 때문에 영원히 멈추면 안 된다.
+_g, _m = pause_macro(u"명령줄", ["A", "B"])
+with io.open(editor_runner.PAUSE_FILE, "w") as _fh:
+    pass
+try:
+    _code, _lines, _text = run_graph(_g, "PauseCli")
+finally:
+    os.remove(editor_runner.PAUSE_FILE)
+check(u"--pause-file 없는 실행은 멈추지 않는다",
+      _code == 0 and marks(_lines) == ["A", "B"],
+      u"exit=%s %r" % (_code, marks(_lines)))
+
+
 # ------------------------------------------------------------------ 결과
 
 shutil.rmtree(WORK, ignore_errors=True)

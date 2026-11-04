@@ -96,8 +96,15 @@ def _all_labels(widget):
     return out
 
 
+import runlog as editor_runlog
 import settings as editor_settings
 import theme
+
+# 실행 로그도 마찬가지다. 테스트가 사용자의 Logs\Runs 에 파일을 쌓거나
+# latest.log 를 덮어쓰면 정작 필요할 때 진짜 로그를 밀어낸다.
+_runlog_tmp = tempfile.mkdtemp(prefix="runlog_")
+editor_runlog.LOG_DIR = os.path.join(_runlog_tmp, "Runs")
+editor_runlog.LATEST = os.path.join(editor_runlog.LOG_DIR, "latest.log")
 
 # 테스트가 사용자의 실제 편집기 설정을 읽거나 덮어쓰지 않게 격리한다.
 # 이걸 안 하면 저장된 레이아웃에 따라 테스트 결과가 달라진다.
@@ -831,10 +838,17 @@ _saved_entry = _rg.entry
 _rtmp = tempfile.mkdtemp(prefix="runfrom_")
 app.macro.save(os.path.join(_rtmp, "RunFrom", "macro.json"))
 
+# 아래부터 가짜 실행이 시작된다. 시험 중에 진짜 F6 을 잡지 않게 시험용 키로 둔다.
+import hotkey as hotkey_module
+app.pause_hotkey = hotkey_module.GlobalHotkey(0x87, lambda: None, hotkey_id=70)
+check(u"편집기를 켠 직후에는 일시정지 버튼이 꺼져 있다",
+      str(app.pause_button.cget("state")) == "disabled",
+      str(app.pause_button.cget("state")))
+
 _run_calls = []
 _orig_run = runner_module.run_macro
 runner_module.run_macro = (
-    lambda path, on_line, on_done, start_node=None:
+    lambda path, on_line, on_done, start_node=None, resume=False:
     _run_calls.append((path, start_node)) or type(
         "FakeJob", (), {"is_running": lambda self: False, "stop": lambda self: None})())
 try:
@@ -2358,6 +2372,264 @@ if _clip_before is not None:
     root.clipboard_append(_clip_before)
 
 
+section(u"이어서 실행 (실패한 노드부터)")
+
+# 엔진 쪽 동작은 graphtest.py 의 31절이 실제 OculiX 로 본다.
+# 여기서는 편집기가 그 기록을 제대로 읽고 버튼을 켜는지만 확인한다.
+_rs_tmp = tempfile.mkdtemp(prefix="resume_")
+_rs_dir = os.path.join(_rs_tmp, "Macros", "Resume")
+_rs_json = _blank_macro(_rs_dir, u"이어서")
+_other_json = _blank_macro(os.path.join(_rs_tmp, "Macros", "Other"), u"다른 것")
+
+_rs_saved_file = runner_module.RESUME_FILE
+_rs_backup = None
+if os.path.exists(_rs_saved_file):
+    with io.open(_rs_saved_file, encoding="utf-8") as fh:
+        _rs_backup = fh.read()
+
+# 부모 반복 > 하위 호출 > 하위 안의 반복 > 실패 노드. 실제 기록과 같은 모양.
+_NESTED = [
+    {"macro": u"MBM_Daily", "node": "L", "enter": "loop",
+     "mode": "forEach", "done": 1},
+    {"macro": u"MBM_Daily", "node": "n5", "enter": "call",
+     "ref": "./Core_Daily_HomeWork"},
+    {"macro": u"Core_Daily_HomeWork", "node": "n7", "enter": "loop",
+     "mode": "times", "done": 2},
+    {"macro": u"Core_Daily_HomeWork", "node": "n3", "enter": "call",
+     "ref": "./NPC_Rona"},
+    {"macro": u"NPC_Rona", "node": "n12", "enter": None},
+]
+
+
+def _write_resume(macro_path, failed=True):
+    payload = {"macro": macro_path, "macroName": u"이어서",
+               "savedAt": "2026-10-06 09:51:52", "reason": u"단계 실패",
+               "failedName": u"나침반 대기",
+               "failedAt": _NESTED if failed else None}
+    os.makedirs(os.path.dirname(_rs_saved_file), exist_ok=True)
+    with io.open(_rs_saved_file, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, ensure_ascii=False))
+
+
+try:
+    check(u"체크포인트 속성은 더 이상 없다 (실패한 노드 기준으로 바뀜)",
+          not any(f["name"] == "checkpoint" for f in schema.COMMON_FIELDS))
+
+    _cv = _open_macro(_rs_json)
+    runner_module.clear_resume()
+    app.refresh_resume_button()
+    check(u"기록이 없으면 [이어서 실행] 이 꺼져 있다",
+          str(app.resume_button.cget("state")) == "disabled",
+          app.resume_button.cget("state"))
+
+    _write_resume(_rs_json)
+    app.refresh_resume_button()
+    check(u"실패 기록이 있으면 켜진다",
+          str(app.resume_button.cget("state")) == "normal",
+          app.resume_button.cget("state"))
+    check(u"버튼에 실패한 노드 이름이 보인다",
+          u"나침반 대기" in app.resume_button.cget("text"),
+          app.resume_button.cget("text"))
+
+    _where = runner_module.describe_resume(runner_module.read_resume(_rs_json))
+    check(u"여러 겹 반복의 회차가 모두 보인다",
+          u"MBM_Daily 반복(L) 2회째" in _where
+          and u"Core_Daily_HomeWork 반복(n7) 3회째" in _where, _where)
+    check(u"호출 사슬과 실패 노드가 순서대로 보인다",
+          _where.index(u"./Core_Daily_HomeWork") < _where.index(u"./NPC_Rona")
+          < _where.index(u"나침반 대기 (n12)"), _where)
+
+    # 다른 매크로의 기록으로는 켜지지 않는다 - 엉뚱한 노드를 돌게 된다
+    _write_resume(_other_json)
+    app.refresh_resume_button()
+    check(u"다른 매크로의 기록으로는 켜지지 않는다",
+          str(app.resume_button.cget("state")) == "disabled",
+          app.resume_button.cget("state"))
+    check(u"read_resume 가 이 매크로 것만 돌려준다",
+          runner_module.read_resume(_rs_json) is None)
+
+    # 위치가 빠진 기록은 쓸 수 없다
+    _write_resume(_rs_json, failed=False)
+    app.refresh_resume_button()
+    check(u"실패 위치가 없는 기록은 쓸 수 없다",
+          str(app.resume_button.cget("state")) == "disabled",
+          app.resume_button.cget("state"))
+    app.resume_macro()
+    check(u"그때 Ctrl+F5 를 누르면 상태줄로 알린다",
+          u"이어서 실행할 위치가 없습니다" in app.status.get(),
+          app.status.get())
+
+    # 매크로를 열면 그 매크로 기준으로 다시 본다
+    _write_resume(_rs_json)
+    _open_macro(_other_json)
+    check(u"다른 매크로를 열면 꺼진다",
+          str(app.resume_button.cget("state")) == "disabled",
+          app.resume_button.cget("state"))
+    _open_macro(_rs_json)
+    check(u"돌아오면 다시 켜진다",
+          str(app.resume_button.cget("state")) == "normal",
+          app.resume_button.cget("state"))
+
+    check(u"Ctrl+F5 가 걸려 있다", bool(app.root.bind("<Control-F5>")))
+
+    # 처음부터 도는 실행은 낡은 기록을 지운다
+    _rs_calls = []
+    _rs_orig = runner_module.run_macro
+    # run_macro 는 검사에 걸리면 modal 대화상자를 띄운다. 테스트에서는
+    # 거기서 영원히 멈추므로 검사를 통과한 것으로 둔다.
+    _rs_orig_validate = app.validate_macro
+    app.validate_macro = lambda: True
+    runner_module.run_macro = (
+        lambda path, on_line, on_done, start_node=None, resume=False:
+        _rs_calls.append(resume) or type(
+            "FakeJob", (), {"is_running": lambda self: False,
+                            "stop": lambda self: None,
+                            "cancelled": False})())
+    try:
+        app.job = None
+        app.run_macro()
+        check(u"처음부터 실행하면 resume=False 로 부른다", _rs_calls == [False],
+              u"%r" % (_rs_calls,))
+        check(u"처음부터 실행하면 낡은 기록을 지운다",
+              runner_module.read_resume(_rs_json) is None)
+
+        _write_resume(_rs_json)
+        del _rs_calls[:]
+        app.job = None
+        app.run_macro(resume=True)
+        check(u"이어서 실행하면 resume=True 로 부른다", _rs_calls == [True],
+              u"%r" % (_rs_calls,))
+        check(u"이어서 실행은 시작할 때 기록을 지우지 않는다",
+              runner_module.read_resume(_rs_json) is not None)
+    finally:
+        runner_module.run_macro = _rs_orig
+        app.validate_macro = _rs_orig_validate
+        app.job = None
+finally:
+    runner_module.clear_resume()
+    if _rs_backup is not None:
+        with io.open(_rs_saved_file, "w", encoding="utf-8") as fh:
+            fh.write(_rs_backup)
+    shutil.rmtree(_rs_tmp, ignore_errors=True)
+
+
+section(u"멈춤 확인 (settleFor)")
+
+# 스크롤이 끝나기 전에 집으면 마우스가 도착할 때쯤 목록이 밀려서 옆 항목을
+# 누른다. 엔진 쪽 동작은 Scripts\Tests\SettleProbe.sikuli 가 본다.
+# 여기서는 편집기에서 그 값을 넣고 뺄 수 있는지만 확인한다.
+_st_names = [f["name"] for f in schema.fields_for("click")]
+check(u"클릭 계열에 '멈춤 확인' 칸이 있다", "settleFor" in _st_names,
+      u"%r" % (_st_names,))
+for _t in ("click", "doubleClick", "rightClick", "hover"):
+    if "settleFor" not in [f["name"] for f in schema.fields_for(_t)]:
+        check(u"%s 에도 있다" % _t, False)
+        break
+else:
+    check(u"클릭/더블/우클릭/호버 모두에 있다", True)
+
+_st_tmp = tempfile.mkdtemp(prefix="settle_")
+_st_dir = os.path.join(_st_tmp, "Macros", "Settle")
+_st_json = _blank_macro(_st_dir, u"멈춤 확인")
+_cv = _open_macro(_st_json)
+_n_click = _cv.add_node("click", 40, 40)
+_n_click["image"] = "btn.png"
+app.on_node_selected(_n_click["id"])
+_settle_entry = _field_entry(app.prop_frame, u"멈춤 확인(초)")
+check(u"속성 패널에 칸이 만들어진다", _settle_entry is not None)
+_settle_entry.delete(0, "end")
+_settle_entry.insert(0, "0.4")
+app.flush_property_edits()
+check(u"값이 숫자로 들어간다", _n_click.get("settleFor") == 0.4,
+      u"%r" % (_n_click.get("settleFor"),))
+_settle_entry.delete(0, "end")
+app.flush_property_edits()
+check(u"비우면 키가 사라진다 (매크로 기본값을 쓴다)",
+      "settleFor" not in _n_click, u"%r" % (_n_click,))
+
+_errs, _warns = _cv.graph.validate()
+check(u"멈춤 확인을 넣어도 검사를 통과한다",
+      not any(u"settleFor" in e for e in _errs), u"%r" % (_errs,))
+
+shutil.rmtree(_st_tmp, ignore_errors=True)
+
+
+section(u"AND/OR 조건 목록에 조건 추가")
+
+# 실제로 났던 사고: 'AND 조건들' 에 이미지 조건을 넣으면 목록에 'None' 으로
+# 들어가고 실행하면 'unknown condition type: None' 으로 죽었다.
+# 원인은 _edit_dialog 의 confirm() 이 같은 dict 를 clear 한 뒤 자기 자신으로
+# update 한 것. 종류를 바꾸면 새 dict 가 들어와서 멀쩡했던 탓에, 기본값
+# (이미지가 있으면) 그대로 확인을 누를 때만 터졌다.
+_cl_tmp = tempfile.mkdtemp(prefix="condlist_")
+_cl_dir = os.path.join(_cl_tmp, "Macros", "CondList")
+_cl_json = _blank_macro(_cl_dir, u"조건 목록")
+_cv = _open_macro(_cl_json)
+_n_all = _cv.add_node("if", 40, 40)
+_n_all["condition"] = {"type": "all", "conditions": []}
+app.on_node_selected(_n_all["id"])
+
+
+def _add_to_list(node, filled, keep_type=True):
+    """조건 목록의 [추가] 버튼과 편집 창을 코드로 재현한다.
+
+    창을 실제로 띄우면 wait_window 에서 멈춘다. _edit_dialog 가 하는 일
+    (홀더에 담기 -> 사용자가 채우기 -> confirm) 만 그대로 따라 한다.
+    """
+    new = schema.new_condition("imageExists")
+    holder = {"cond": new}
+    if not keep_type:
+        # 사용자가 종류 콤보를 바꾼 경우. set_cond 가 새 dict 로 갈아 끼운다.
+        holder["cond"] = schema.new_condition("textExists")
+    holder["cond"].update(filled)
+    # ---- confirm() 과 같은 처리
+    picked = dict(holder["cond"])
+    new.clear()
+    new.update(picked)
+    node["condition"]["conditions"].append(new)
+    return new
+
+
+_first = _add_to_list(_n_all, {"image": "a.png"})
+check(u"기본 종류 그대로 넣어도 type 이 남는다",
+      _first.get("type") == "imageExists" and _first.get("image") == "a.png",
+      u"%r" % (_first,))
+check(u"목록에 'None' 으로 보이지 않는다",
+      schema.describe_condition(_first) != u"None",
+      schema.describe_condition(_first))
+
+_second = _add_to_list(_n_all, {"image": "b.png", "type": "imageMissing"})
+check(u"두 번째 조건도 멀쩡하다",
+      _second.get("type") == "imageMissing", u"%r" % (_second,))
+
+_third = _add_to_list(_n_all, {"text": u"확인"}, keep_type=False)
+check(u"종류를 바꾼 경우도 그대로 (예전에도 되던 길)",
+      _third.get("type") == "textExists", u"%r" % (_third,))
+
+check(u"AND 요약이 세 조건을 모두 보여 준다",
+      schema.describe_condition(_n_all["condition"])
+      == u"(a.png 있으면 AND b.png 없으면 AND 글자 \"확인\" 보이면)",
+      schema.describe_condition(_n_all["condition"]))
+
+# 검사가 종류 없는 조건을 잡아내야 한다. 이 사고가 다시 나더라도
+# 실행하기 전에 알 수 있다.
+_n_all["condition"]["conditions"].append({"image": "c.png"})
+_errs, _warns = _cv.graph.validate()
+check(u"종류 없는 조건을 검사가 잡는다",
+      any(u"조건의 종류가 잘못됐습니다" in e for e in _errs), u"%r" % (_errs,))
+_n_all["condition"]["conditions"].pop()
+_errs, _warns = _cv.graph.validate()
+check(u"멀쩡한 조건은 잡지 않는다",
+      not any(u"조건의 종류" in e for e in _errs), u"%r" % (_errs,))
+
+check(u"엔진과 편집기의 조건 종류가 일치한다",
+      set(schema.CONDITION_TYPES.keys()) == set(graph_model.CONDITION_TYPES),
+      u"%r" % (sorted(set(schema.CONDITION_TYPES.keys())
+                      ^ set(graph_model.CONDITION_TYPES)),))
+
+shutil.rmtree(_cl_tmp, ignore_errors=True)
+
+
 section(u"속성칸을 Enter 없이 빠져나가도 값이 남는가")
 
 # Enter 를 치지 않고 다른 노드를 클릭하면 Tk 의 <FocusOut> 이 오기 전에
@@ -2484,6 +2756,214 @@ check(u"줄바꿈을 한 줄로 줄인다",
       notify._escape(_multiline) == u"위 아래", notify._escape(_multiline))
 
 
+section(u"일시정지 / 재개")
+
+# 엔진이 정말 멈추는지는 graphtest.py 33절이 본다. 여기서는 버튼·상태줄·단축키가
+# 맞게 움직이는지만 확인한다.
+import ctypes
+import time as _time_mod
+
+
+class _PauseJob(object):
+    def __init__(self):
+        self.calls = []
+        self.running = True
+        self.can_pause = True
+        self.cancelled = False
+
+    def is_running(self):
+        return self.running
+
+    def stop(self):
+        self.running = False
+
+    def pause(self):
+        self.calls.append("pause")
+        return self.can_pause
+
+    def unpause(self):
+        self.calls.append("unpause")
+
+
+_beeps = []
+_orig_beep = macro_editor._beep
+macro_editor._beep = _beeps.append
+_saved_job = app.job
+try:
+    _state = lambda: str(app.pause_button.cget("state"))
+    _label = lambda: app.pause_button.cget("text")
+
+    # 앞 절의 가짜 실행들은 시작만 하고 끝나지 않았다. 여기서 끝낸 상태로 만든다.
+    app._stop_pause_controls()
+    app.job = None
+    app.toggle_pause()
+    check(u"실행 중이 아니면 아무 일도 없다", app.paused is False)
+    check(u"F6 이 편집기 창 안에서도 걸려 있다 (전역 등록 실패 대비)",
+          bool(app.root.bind("<F6>")))
+
+    _job = _PauseJob()
+    app.job = _job
+    # 실제 F6 을 잡지 않게 시험용 키로 바꿔 둔다
+    app.pause_hotkey = hotkey_module.GlobalHotkey(
+        0x87, lambda: None, hotkey_id=71)     # VK_F24
+    app._start_pause_controls()
+    check(u"실행이 시작되면 버튼이 켜진다", _state() == "normal", _state())
+    check(u"실행 중에는 전역 단축키가 등록된다", app.pause_hotkey.active,
+          u"%r" % (app.pause_hotkey.error,))
+
+    app.toggle_pause()
+    check(u"누르면 일시정지를 요청한다",
+          _job.calls == ["pause"] and app.paused, u"%r" % (_job.calls,))
+    check(u"버튼이 재개로 바뀐다", u"재개" in _label(), _label())
+    check(u"요청 단계에서는 '멈췄다' 고 하지 않는다",
+          u"요청" in app.status.get(), app.status.get())
+
+    app.log_queue.put((u"[10:00:00]     | %s 멈췄습니다 - 대기 중"
+                       % graph_model.PAUSED_MARK, None))
+    app._drain_log()
+    check(u"엔진이 멈췄다고 알리면 상태줄이 바뀐다",
+          u"일시정지됨" in app.status.get(), app.status.get())
+    check(u"멈추면 소리로 알린다", len(_beeps) == 1, u"%r" % (_beeps,))
+
+    del _beeps[:]
+    app.log_queue.put((u"%s 주의: 마우스 버튼이 눌린 채입니다 (LEFT)"
+                       % graph_model.PAUSED_MARK, None))
+    app._drain_log()
+    check(u"눌린 버튼 경고로는 소리를 두 번 내지 않는다", _beeps == [],
+          u"%r" % (_beeps,))
+
+    app.toggle_pause()
+    check(u"다시 누르면 재개를 요청한다",
+          _job.calls == ["pause", "unpause"] and not app.paused,
+          u"%r" % (_job.calls,))
+    check(u"버튼이 일시정지로 돌아온다", u"일시정지" in _label(), _label())
+    app.log_queue.put((u"%s 3.0초 멈춰 있었습니다. 이어서 진행합니다"
+                       % graph_model.RESUMED_MARK, None))
+    app._drain_log()
+    check(u"재개되면 상태줄이 돌아온다", u"실행 중" in app.status.get(),
+          app.status.get())
+
+    # F6 은 다른 스레드에서 온다. 큐를 거쳐 Tk 스레드에서 처리돼야 한다.
+    del _job.calls[:]
+    app.log_queue.put((("__PAUSE_KEY__", None), None))
+    app._drain_log()
+    check(u"단축키 신호가 큐를 거쳐 일시정지로 이어진다",
+          _job.calls == ["pause"] and app.paused, u"%r" % (_job.calls,))
+
+    # 일시정지한 채로 끝나도 다음 실행에 상태가 남으면 안 된다
+    app._stop_pause_controls()
+    check(u"실행이 끝나면 버튼이 꺼지고 초기화된다",
+          _state() == "disabled" and not app.paused and u"일시정지" in _label(),
+          _label())
+    check(u"끝나면 단축키를 돌려준다", not app.pause_hotkey.active)
+
+    _job = _PauseJob()
+    _job.can_pause = False
+    app.job = _job
+    app.pause_button.config(state="normal")
+    app.toggle_pause()
+    check(u"요청에 실패하면 일시정지 상태가 되지 않는다", app.paused is False,
+          app.status.get())
+    check(u"실패를 알린다", u"못했습니다" in app.status.get(), app.status.get())
+    app.pause_button.config(state="disabled")
+
+    # 키 등록이 실패해도 실행을 막지 않고, 대안을 알려 준다
+    _fail_hk = hotkey_module.GlobalHotkey(0x87, lambda: None, hotkey_id=72)
+    check(u"시험용 키 등록", _fail_hk.start(), u"%r" % (_fail_hk.error,))
+    app.pause_hotkey = hotkey_module.GlobalHotkey(0x87, lambda: None,
+                                                  hotkey_id=73)
+    _hk_before = len(app._log_buffer)
+    app.job = _PauseJob()
+    app._start_pause_controls()
+    _hk_lines = [t for t, _tag in app._log_buffer[_hk_before:]]
+    check(u"키를 선점당하면 이유와 대안을 로그로 알린다",
+          any(u"F6" in t and u"다른 프로그램" in t and u"툴바" in t
+              for t in _hk_lines), u"%r" % (_hk_lines,))
+    check(u"그래도 버튼은 쓸 수 있다", _state() == "normal", _state())
+    app._stop_pause_controls()
+    _fail_hk.stop()
+
+    # 실제 등록 / 메시지 수신 / 해제
+    _pressed = []
+    _hk = hotkey_module.GlobalHotkey(0x87, lambda: _pressed.append(1),
+                                     hotkey_id=74)
+    check(u"RegisterHotKey 로 등록된다", _hk.start(), u"%r" % (_hk.error,))
+    check(u"두 번 시작해도 괜찮다", _hk.start())
+    _other = hotkey_module.GlobalHotkey(0x87, lambda: None, hotkey_id=75)
+    check(u"같은 키를 또 등록하면 실패로 돌려준다", _other.start() is False,
+          u"%r" % (_other.error,))
+    check(u"실패 이유가 사람이 읽을 문장이다",
+          u"다른 프로그램" in (_other.error or u""), u"%r" % (_other.error,))
+    _other.stop()
+
+    # 실제 키를 누르는 대신 WM_HOTKEY 를 그 스레드로 보낸다
+    ctypes.windll.user32.PostThreadMessageW(_hk._thread_id, 0x0312, 74, 0)
+    for _i in range(40):
+        if _pressed:
+            break
+        _time_mod.sleep(0.05)
+    check(u"WM_HOTKEY 를 받으면 콜백이 불린다", _pressed == [1],
+          u"%r" % (_pressed,))
+    _hk.stop()
+    check(u"해제하면 등록 상태가 풀린다", not _hk.active)
+    _again = hotkey_module.GlobalHotkey(0x87, lambda: None, hotkey_id=76)
+    check(u"해제한 키는 다시 등록할 수 있다", _again.start(),
+          u"%r" % (_again.error,))
+    _again.stop()
+    _again.stop()
+    check(u"해제를 두 번 불러도 괜찮다", not _again.active)
+finally:
+    macro_editor._beep = _orig_beep
+    app.pause_hotkey = hotkey_module.GlobalHotkey(0x87, lambda: None,
+                                                  hotkey_id=77)
+    app.paused = False
+    app.pause_button.config(state="disabled")
+    app.job = _saved_job
+
+
+section(u"검사: 투명 템플릿 + DPI 불일치 경고")
+
+# 판정 자체(PNG 읽기)는 selftest 가 본다. 여기서는 [매크로 검사] 가 그 판정을
+# 실제로 불러 경고로 띄우는지 - 연결부만 확인한다.
+import pnginfo as _pnginfo_mod
+import screenutil
+_mk_tmp = tempfile.mkdtemp(prefix="maskwarn_")
+_mk_json = _blank_macro(os.path.join(_mk_tmp, "Macros", "Masked"), u"투명")
+for _nm in ("house.png", "ok.png"):
+    shutil.copyfile(os.path.join(MACROS_REAL, "Example", "never_matches.png"),
+                    os.path.join(_mk_tmp, "Macros", "Masked", _nm))
+_mk_seen = []
+_mk_orig = _pnginfo_mod.mask_dpi_risk
+
+
+def _mk_fake(path, system_dpi):
+    _mk_seen.append(system_dpi)
+    return u"가짜 이유" if os.path.basename(path) == "house.png" else None
+
+
+_pnginfo_mod.mask_dpi_risk = _mk_fake
+try:
+    _cv = _open_macro(_mk_json)
+    _cv.add_node("waitImage", 40, 40)["image"] = "house.png"
+    _cv.add_node("waitImage", 300, 40)["image"] = "ok.png"
+    _mk_before = len(app._log_buffer)
+    app.validate_macro()
+    _mk_lines = [t for t, _tag in app._log_buffer[_mk_before:]]
+    check(u"[매크로 검사] 가 위험한 템플릿을 경고한다",
+          any(u"house.png" in t and u"가짜 이유" in t and t.startswith(u"경고")
+              for t in _mk_lines), u"%r" % (_mk_lines,))
+    check(u"안전한 템플릿은 경고하지 않는다",
+          not any(u"ok.png" in t for t in _mk_lines), u"%r" % (_mk_lines,))
+    check(u"경고일 뿐 실행을 막지는 않는다 (검사 통과)",
+          any(u"검사 통과" in t for t in _mk_lines), u"%r" % (_mk_lines,))
+    check(u"시스템 DPI 를 96 x 화면 배율로 넘긴다",
+          _mk_seen and abs(_mk_seen[0] - 96.0 * screenutil.scale()[0]) < 0.01,
+          u"%r" % (_mk_seen[:1],))
+finally:
+    _pnginfo_mod.mask_dpi_risk = _mk_orig
+    shutil.rmtree(_mk_tmp, ignore_errors=True)
+
+
 section(u"하위 매크로 (UE BP의 '함수')")
 
 _fam_tmp = tempfile.mkdtemp(prefix="family_")
@@ -2602,6 +3082,167 @@ finally:
     macro_editor.MACROS_DIR = _saved_macros_dir
     shutil.rmtree(_fam_tmp, ignore_errors=True)
 
+
+section(u"감시 설정 (handlers / watch)")
+
+_w_tmp = tempfile.mkdtemp(prefix="watch_")
+_w_macros = os.path.join(_w_tmp, "Macros")
+_w_cond = {"type": "imageExists", "image": "popup.png", "region": [0, 0, 50, 50]}
+
+
+def _write_watch(folder, name, watch=None, handlers=None, settings=True):
+    path = _write_macro(folder, name, settings=settings)
+    with io.open(path, encoding="utf-8") as fh:
+        data = json.loads(fh.read())
+    if watch is not None:
+        data["watch"] = watch
+    if handlers is not None:
+        data["handlers"] = handlers
+    with io.open(path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(data, ensure_ascii=False, indent=2))
+    return path
+
+
+def _walk_widgets(widget):
+    yield widget
+    for child in widget.winfo_children():
+        for item in _walk_widgets(child):
+            yield item
+
+
+_w_main_dir = os.path.join(_w_macros, "Main")
+_write_watch(os.path.join(_w_macros, "PopupClose"), u"팝업 닫기", watch=_w_cond)
+_write_watch(os.path.join(_w_macros, "Plain"), u"평범한 매크로")
+_w_main = _write_watch(_w_main_dir, u"메인", handlers=["PopupClose"])
+_write_watch(os.path.join(_w_main_dir, "RewardClose"), u"보상창 닫기",
+             watch=_w_cond, settings=False)
+shutil.copyfile(os.path.join(MACROS_REAL, "Example", "never_matches.png"),
+                os.path.join(_w_macros, "PopupClose", "popup.png"))
+
+_saved_macros_dir = macro_editor.MACROS_DIR
+macro_editor.MACROS_DIR = _w_macros
+try:
+    app.macro = model.Macro.load(_w_main)
+    app.current_path = None
+    app.apply_mode()
+
+    _cands = [r for r, _n in app.watch_candidates()]
+    check(u"감시 후보: 감시 조건이 있는 라이브러리 + 가족 하위만",
+          sorted(_cands) == ["./RewardClose", "PopupClose"], u"%r" % (_cands,))
+
+    _errs, _warns = app.check_handler_targets()
+    check(u"올바른 감시 목록은 검사를 통과한다", not _errs, u"%r" % (_errs,))
+    app.macro.data["handlers"] = ["PopupClose", "Plain", "Gone"]
+    _errs, _warns = app.check_handler_targets()
+    check(u"감시 조건 없는 매크로를 걸면 검사가 막는다",
+          any(u"감시 조건(watch)이 없습니다" in e for e in _errs), u"%r" % (_errs,))
+    check(u"없는 감시 매크로를 걸면 검사가 막는다",
+          any(u"찾을 수 없습니다: Gone" in e for e in _errs), u"%r" % (_errs,))
+    app.macro.data["handlers"] = ["PopupClose"]
+
+    # --- 대화상자: 열리고, 목록이 보이고, 감시 조건을 켜고, 간격이 들어간다
+    _before = list(app.root.winfo_children())
+    app.edit_watch()
+    _dialogs = [w for w in app.root.winfo_children()
+                if w not in _before and isinstance(w, tk.Toplevel)]
+    check(u"감시 설정 대화상자가 열린다", len(_dialogs) == 1, u"%d개" % len(_dialogs))
+    if _dialogs:
+        _dlg = _dialogs[0]
+        _dlg.grab_release()
+        _lists = [w for w in _walk_widgets(_dlg) if isinstance(w, tk.Listbox)]
+        check(u"걸린 감시가 목록에 보인다",
+              len(_lists) == 1 and _lists[0].size() == 1
+              and u"PopupClose" in _lists[0].get(0),
+              u"%r" % ([l.get(0, "end") for l in _lists],))
+        _checks = [w for w in _walk_widgets(_dlg)
+                   if isinstance(w, ttk_module.Checkbutton)]
+        check(u"감시 매크로로 쓰기 체크가 있다", len(_checks) == 1)
+        if _checks:
+            _checks[0].invoke()
+            root.update_idletasks()
+            check(u"체크하면 감시 조건이 생긴다",
+                  graph_model.is_watch_macro(app.macro.data),
+                  u"%r" % (app.macro.data.get("watch"),))
+            _combos = [w for w in _walk_widgets(_dlg)
+                       if isinstance(w, ttk_module.Combobox)]
+            check(u"감시 조건 편집기가 나타난다", len(_combos) >= 1)
+            _checks[0].invoke()
+            check(u"체크를 끄면 감시 조건이 지워진다",
+                  "watch" not in app.macro.data)
+        _entries = [w for w in _walk_widgets(_dlg)
+                    if isinstance(w, ttk_module.Entry)
+                    and not isinstance(w, ttk_module.Combobox)]
+        _buttons = [w for w in _walk_widgets(_dlg)
+                    if isinstance(w, ttk_module.Button)]
+        _close = [b for b in _buttons if b.cget("text") == u"닫기"]
+        if _entries and _close:
+            _entries[0].delete(0, "end")
+            _entries[0].insert(0, "2.5")
+            _close[0].invoke()
+            check(u"확인 간격이 설정에 들어간다",
+                  app.macro.data["settings"].get("handlerInterval") == 2.5,
+                  u"%r" % (app.macro.data["settings"].get("handlerInterval"),))
+            check(u"닫기를 누르면 대화상자가 닫힌다", not _dlg.winfo_exists())
+        else:
+            check(u"간격 칸과 닫기 버튼이 있다", False,
+                  u"칸 %d, 닫기 %d" % (len(_entries), len(_close)))
+            _dlg.destroy()
+
+    # --- 하위 매크로에서는 간격을 고칠 수 없다 (부모 것을 따른다)
+    app.macro = model.Macro.load(os.path.join(_w_main_dir, "RewardClose",
+                                              "macro.json"))
+    app.current_path = None
+    app.apply_mode()
+    _before = list(app.root.winfo_children())
+    app.edit_watch()
+    _dialogs = [w for w in app.root.winfo_children()
+                if w not in _before and isinstance(w, tk.Toplevel)]
+    if _dialogs:
+        _dlg = _dialogs[0]
+        _dlg.grab_release()
+        _entries = [w for w in _walk_widgets(_dlg)
+                    if isinstance(w, ttk_module.Entry)
+                    and not isinstance(w, ttk_module.Combobox)]
+        check(u"하위 매크로는 간격 칸이 꺼져 있다",
+              bool(_entries) and "disabled" in str(_entries[0].cget("state")),
+              u"%r" % ([str(e.cget("state")) for e in _entries],))
+        _cands = [r for r, _n in app.watch_candidates()]
+        check(u"자기 자신은 감시 후보에서 빠진다",
+              "./RewardClose" not in _cands, u"%r" % (_cands,))
+        _dlg.destroy()
+
+    # --- 감시 조건의 이미지도 '사용 중' 이고 '없는 이미지' 검사 대상이다
+    app.macro = model.Macro.load(os.path.join(_w_macros, "PopupClose",
+                                              "macro.json"))
+    app.apply_mode()
+    check(u"있는 감시 이미지는 누락으로 잡히지 않는다",
+          app.macro.missing_images() == [], u"%r" % (app.macro.missing_images(),))
+    app.macro.data["watch"] = dict(_w_cond, image="nope.png")
+    check(u"없는 감시 이미지는 누락으로 잡힌다",
+          (u"감시 조건", "nope.png") in app.macro.missing_images(),
+          u"%r" % (app.macro.missing_images(),))
+    _users = app.find_image_users(os.path.join(_w_macros, "PopupClose",
+                                               "popup.png"))
+    check(u"감시 조건에만 쓰는 이미지도 사용처로 잡힌다",
+          any(u"감시 조건" == node for _p, node in _users), u"%r" % (_users,))
+
+    # --- 감시 매크로의 이름을 바꾸면 감시 목록의 참조도 고친다
+    _callers = app.find_macro_callers("PopupClose")
+    check(u"감시 목록에 건 매크로도 참조로 잡힌다",
+          any(path == _w_main for _r, _id, path in _callers), u"%r" % (_callers,))
+    _n = app._rewrite_call_refs(_callers, "PopupOff")
+    with io.open(_w_main, encoding="utf-8") as fh:
+        _after = json.loads(fh.read())
+    check(u"감시 목록의 참조가 새 이름으로 바뀐다",
+          _n == 1 and _after.get("handlers") == ["PopupOff"],
+          u"%d건 %r" % (_n, _after.get("handlers")))
+finally:
+    macro_editor.MACROS_DIR = _saved_macros_dir
+    shutil.rmtree(_w_tmp, ignore_errors=True)
+    app.macro = model.Macro(graph_model.blank(u"새 매크로"))
+    app.current_path = None
+    app.apply_mode()
+
 section(u"시작 노드로 이동")
 
 _bar_texts = []
@@ -2670,6 +3311,93 @@ app.goto_entry_node()
 check(u"트리 형식에서는 안내만 하고 넘어간다",
       u"노드 모드" in app.status.get(), u"%r" % (app.status.get(),))
 
+section(u"실행 로그 파일")
+
+# 실행 로그 패널은 편집기를 닫으면 사라진다. 나중에 문제를 되짚으려면
+# 파일로 남아 있어야 한다. 여기서는 OculiX 를 실제로 돌리지 않고
+# 로그가 열리고 · 쌓이고 · 결과와 함께 닫히는지만 본다.
+
+app.macro = model.Macro(graph_model.blank(u"로그 남기기"))
+app.current_path = None
+app.apply_mode()
+_lg1 = app.canvas_view.add_node("log", 0, 0)["id"]
+app.canvas_view.graph.entry = _lg1
+_ltmp = tempfile.mkdtemp(prefix="runlog_macro_")
+app.macro.save(os.path.join(_ltmp, "LogMacro", "macro.json"))
+
+_orig_run_log = runner_module.run_macro
+_orig_notify_log = notify.notify
+runner_module.run_macro = (
+    lambda path, on_line, on_done, start_node=None, resume=False:
+    type("FakeJob", (), {"is_running": lambda self: False,
+                         "stop": lambda self: None,
+                         "cancelled": False})())
+notify.notify = lambda title, message, on_error=None: True
+try:
+    app.job = None
+    app.run_macro()
+    _log_path = app.runlog.path if app.runlog else None
+    check(u"실행하면 로그 파일이 열린다",
+          bool(_log_path) and os.path.exists(_log_path), u"%s" % (_log_path,))
+    app.log_line(u"[INFO] 실행 중 한 줄", None)
+    app._on_run_done(0)
+    check(u"끝나면 로그 파일을 닫는다", app.runlog is None)
+
+    _log_text = io.open(_log_path, encoding="utf-8").read() if _log_path else u""
+    check(u"실행 중 출력이 파일에 남는다", u"[INFO] 실행 중 한 줄" in _log_text)
+    check(u"머리말에 매크로 파일 경로", u"LogMacro" in _log_text)
+    check(u"머리말에 매크로 이름", u"로그 남기기" in _log_text)
+    check(u"꼬리말에 종료 코드", u"exit 0" in _log_text and u"정상 종료" in _log_text,
+          _log_text.strip().splitlines()[-1] if _log_text else u"")
+    check(u"로그 경로를 패널에 알려 준다",
+          bool(_log_path) and _log_path in app.log.get("1.0", "end"))
+    check(u"latest.log 사본이 같은 내용",
+          os.path.exists(editor_runlog.LATEST)
+          and io.open(editor_runlog.LATEST, encoding="utf-8").read() == _log_text)
+
+    app.log_line(u"실행이 끝난 뒤의 줄", None)
+    check(u"닫힌 뒤 줄은 파일에 안 들어간다",
+          u"실행이 끝난 뒤의 줄" not in io.open(_log_path, encoding="utf-8").read())
+
+    # 중지한 실행도 이유가 남아야 한다
+    app.job = None
+    app.run_macro()
+    _stopped_path = app.runlog.path
+    app.job.cancelled = True
+    app._on_run_done(2)
+    check(u"중지한 실행은 그렇게 적힌다",
+          u"사용자가 중지" in io.open(_stopped_path, encoding="utf-8").read())
+
+    # 실행 중에 편집기를 닫으면 열린 파일이 그대로 남으면 안 된다
+    app.job = None
+    app.run_macro()
+    _aborted_path = app.runlog.path
+    app.runlog.abort(u"편집기를 닫음")
+    check(u"중단된 실행도 꼬리말이 붙는다",
+          u"편집기를 닫음" in io.open(_aborted_path, encoding="utf-8").read())
+finally:
+    runner_module.run_macro = _orig_run_log
+    notify.notify = _orig_notify_log
+    app.job = None
+    app.runlog = None
+    shutil.rmtree(_ltmp, ignore_errors=True)
+
+# 오래된 로그 정리. 무한히 쌓이면 폴더가 못 쓰게 된다.
+for _i in range(editor_runlog.KEEP + 5):
+    io.open(os.path.join(editor_runlog.LOG_DIR,
+                         "20200101-%06d_오래된.log" % _i),
+            "w", encoding="utf-8").write(u"x")
+editor_runlog.prune()
+_left = [n for n in os.listdir(editor_runlog.LOG_DIR)
+         if editor_runlog._STAMPED.match(n)]
+check(u"오래된 로그는 정리된다", len(_left) == editor_runlog.KEEP, u"%d개" % len(_left))
+check(u"latest.log 는 정리 대상이 아니다",
+      os.path.exists(editor_runlog.LATEST))
+check(u"파일 이름에 쓸 수 없는 글자를 바꾼다",
+      editor_runlog._safe_name(u'아침/퀘스트:1') == u"아침_퀘스트_1",
+      editor_runlog._safe_name(u'아침/퀘스트:1'))
+
+
 print("")
 print("=" * 62)
 print("passed %d / %d" % (len(PASS), len(PASS) + len(FAIL)))
@@ -2679,6 +3407,7 @@ except Exception:
     pass
 editor_settings.PATH = _real_settings_path
 shutil.rmtree(_settings_tmp, ignore_errors=True)
+shutil.rmtree(_runlog_tmp, ignore_errors=True)
 if FAIL:
     print(u"실패:")
     for name in FAIL:
