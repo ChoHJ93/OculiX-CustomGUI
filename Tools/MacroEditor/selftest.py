@@ -8,6 +8,7 @@
 """
 
 import os
+import re
 import sys
 import json
 import shutil
@@ -408,6 +409,52 @@ try:
           and u"[캡처]" in risky[0][2], risky and risky[0][2])
 finally:
     shutil.rmtree(_pt, ignore_errors=True)
+
+
+section("저장된 창 위치 (모니터 구성이 바뀌었을 때)")
+
+import screenutil
+
+# 실제로 겪은 값. 왼쪽 모니터에 있던 창을 1920x1080 단일 모니터에서 열었다.
+_one = [(0, 0, 1920, 1040)]
+_text, _moved = screenutil.fit_geometry("1924x1041+-2065+-24", _one)
+check("없는 모니터의 위치는 옮긴다", _moved, _text)
+_m = re.match(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$", _text)
+_w, _h, _x, _y = [int(v) for v in _m.groups()]
+check("옮긴 창이 작업 영역 안에 들어온다",
+      _x >= 0 and _y >= 0 and _x + _w <= 1920 and _y + _h + 32 <= 1040, _text)
+check("크기는 화면에 맞게 줄인다", _w == 1920 and _h == 1008, _text)
+
+_text, _moved = screenutil.fit_geometry("800x600+100+50", _one)
+check("보이는 창은 그대로 둔다",
+      _text == "800x600+100+50" and not _moved, _text)
+_text, _moved = screenutil.fit_geometry("800x600+-300+50", _one)
+check("일부가 밖이어도 제목 표시줄을 잡을 수 있으면 둔다", not _moved, _text)
+_text, _moved = screenutil.fit_geometry("800x600+-750+50", _one)
+check("제목 표시줄이 거의 안 보이면 옮긴다", _moved, _text)
+_text, _moved = screenutil.fit_geometry("800x600+100+2000", _one)
+check("세로로 벗어나도 옮긴다", _moved, _text)
+_text, _moved = screenutil.fit_geometry("800x600+-20+-8", _one)
+check("최대화에 가까운 음수 좌표는 옮기지 않는다", not _moved, _text)
+
+_two = [(0, 0, 1920, 1040), (-2560, 0, 0, 1400)]
+_text, _moved = screenutil.fit_geometry("1924x1041+-2065+-24", _two)
+check("모니터가 그대로 있으면 왼쪽 음수 좌표도 그대로 둔다", not _moved, _text)
+_off = [(0, 0, 1366, 728), (1366, 0, 3286, 1040)]
+_text, _moved = screenutil.fit_geometry("900x700+-1500+10", _off)
+check("주 모니터 기준으로 가운데에 놓는다",
+      _text == "900x696+233+0", _text)
+
+check("위치가 없는 값은 건드리지 않는다",
+      screenutil.fit_geometry("1320x860", _one) == ("1320x860", False))
+check("읽을 수 없는 값은 건드리지 않는다",
+      screenutil.fit_geometry("망가진 값", _one) == (u"망가진 값", False))
+check("모니터 정보를 못 얻으면 건드리지 않는다",
+      screenutil.fit_geometry("800x600+-5000+0", [])
+      == ("800x600+-5000+0", False))
+_real = screenutil.work_areas()
+check("실제 모니터의 작업 영역을 읽는다",
+      len(_real) >= 1 and _real[0][2] > _real[0][0], "%r" % (_real,))
 
 
 # --------------------------------------------------------------- 결과

@@ -115,11 +115,24 @@ editor_settings.PATH = os.path.join(_settings_tmp, "layout.json")
 root = tk.Tk()
 root.withdraw()                      # 화면에 띄우지 않는다
 theme.apply(root)
+# 저장된 창 위치가 없는 모니터를 가리키는 상태로 연다. 모니터를 뺀 뒤 창이
+# 화면 밖에 떠서 보이지 않던 사고의 재현이다.
+_real_load = macro_editor.settings.load
+macro_editor.settings.load = lambda: dict(_real_load(),
+                                          geometry="1400x900+-9000+-24")
 app = macro_editor.MacroEditorApp(root)
+macro_editor.settings.load = _real_load
+root.update_idletasks()
+_start_geometry = root.geometry()
 root.withdraw()
 
 section("앱 구성")
 check("앱 생성", app is not None)
+check("저장 위치가 화면 밖이면 보이는 곳에서 연다",
+      macro_editor.screenutil.fit_geometry(_start_geometry)[1] is False,
+      _start_geometry)
+check("창을 옮겼다고 로그로 알린다",
+      any(u"화면 밖" in _t for _t, _tag in app._log_buffer))
 check("트리 위젯 존재", app.tree is not None)
 check("빈 매크로로 시작", app.macro.count() == 0)
 

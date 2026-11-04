@@ -323,7 +323,9 @@ class MacroEditorApp(object):
         self.macro = model.Macro(graph_model.blank(u"새 매크로"))
 
         root.title(u"OculiX 매크로 편집기")
-        root.geometry(self.config.get("geometry") or "1320x860")
+        geometry, window_moved = screenutil.fit_geometry(
+            self.config.get("geometry") or "1320x860")
+        root.geometry(geometry)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self._build_menu()
@@ -331,6 +333,9 @@ class MacroEditorApp(object):
         self._build_status()          # 아래쪽에 먼저 붙여 둔다
         self._build_body()
         self.dock.set_layout(self.config.get("layout"))
+        if window_moved:
+            self.log_line(u"저장된 창 위치가 지금 화면 밖이라 주 모니터로 "
+                          u"옮겼습니다 (모니터 구성이 바뀐 경우)", "info")
 
         self.root.after(80, self._drain_log)
         self._check_environment()

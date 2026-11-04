@@ -16,6 +16,7 @@
 """
 
 import ctypes
+import re
 from ctypes import wintypes
 
 _user32 = ctypes.windll.user32
@@ -57,6 +58,79 @@ class _DEVMODE(ctypes.Structure):
         ("dmPanningWidth", wintypes.DWORD),
         ("dmPanningHeight", wintypes.DWORD),
     ]
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+_MONITORINFOF_PRIMARY = 1
+_MonitorEnumProc = ctypes.WINFUNCTYPE(
+    wintypes.BOOL, wintypes.HANDLE, wintypes.HDC,
+    ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
+_user32.EnumDisplayMonitors.argtypes = (wintypes.HDC,
+                                        ctypes.POINTER(wintypes.RECT),
+                                        _MonitorEnumProc, wintypes.LPARAM)
+_user32.GetMonitorInfoW.argtypes = (wintypes.HANDLE,
+                                    ctypes.POINTER(_MONITORINFO))
+
+# 제목 표시줄 높이와, 창을 끌어 옮기려면 보여야 하는 최소 폭.
+_TITLE_HEIGHT = 32
+_TITLE_MIN_VISIBLE = 120
+
+_GEOMETRY = re.compile(r"^(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$")
+
+
+def work_areas():
+    """모니터별 작업 영역 [(왼, 위, 오른, 아래), ...]. 주 모니터가 맨 앞이다."""
+    found = []
+
+    def visit(monitor, _dc, _rect, _param):
+        info = _MONITORINFO()
+        info.cbSize = ctypes.sizeof(info)
+        if _user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            work = info.rcWork
+            primary = bool(info.dwFlags & _MONITORINFOF_PRIMARY)
+            found.append((not primary,
+                          (work.left, work.top, work.right, work.bottom)))
+        return True
+
+    _user32.EnumDisplayMonitors(None, None, _MonitorEnumProc(visit), 0)
+    return [area for _order, area in sorted(found)]
+
+
+def fit_geometry(text, areas=None):
+    """저장된 창 위치가 지금 화면에서 보이게 고친다. (geometry, 옮겼는가).
+
+    모니터 구성이 바뀌면 저장된 좌표가 없는 화면을 가리킨다. Windows 는 그런
+    창을 알아서 옮겨 주지 않아서, 창은 떠 있는데 보이지 않게 된다.
+    제목 표시줄을 잡을 수 있는 한 그대로 둔다 - 위치는 사용자가 정한 것이다.
+    못 잡으면 주 모니터 가운데로 옮기고, 크기는 그 화면에 맞게 줄인다.
+    """
+    matched = _GEOMETRY.match(text or "")
+    if areas is None:
+        areas = work_areas()
+    if not matched or not areas:
+        return text, False
+
+    width, height, x, y = [int(v) for v in matched.groups()]
+    for left, top, right, bottom in areas:
+        wide = min(right, x + width) - max(left, x)
+        tall = min(bottom, y + _TITLE_HEIGHT) - max(top, y)
+        if wide >= min(width, _TITLE_MIN_VISIBLE) and tall > 0:
+            return text, False
+
+    left, top, right, bottom = areas[0]
+    area_w, area_h = right - left, bottom - top - _TITLE_HEIGHT
+    width, height = min(width, area_w), min(height, area_h)
+    return ("%dx%d+%d+%d" % (width, height,
+                             left + (area_w - width) // 2,
+                             top + (area_h - height) // 2)), True
 
 
 def logical_screen_size():
