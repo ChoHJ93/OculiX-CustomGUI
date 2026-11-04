@@ -139,6 +139,30 @@ def _free_name(folder, name):
     return None
 
 
+def _copy_variants(source, target_dir, name, new_name):
+    u"""`@폴더` 에 다시 찍어 둔 이미지도 함께 옮긴다. 옮긴 개수를 돌려준다.
+
+    옮기는 쪽에 이미 있으면 덮어쓰지 않는다 - 기준 이미지와 같은 원칙이다.
+    """
+    copied = 0
+    for folder in graph_model.capture_folders(source):
+        src = os.path.join(folder, name)
+        if not os.path.isfile(src):
+            continue
+        folder_to = os.path.join(target_dir, os.path.basename(folder))
+        if not os.path.isdir(folder_to):
+            os.makedirs(folder_to)
+        info = os.path.join(folder, graph_model.CAPTURE_INFO)
+        info_to = os.path.join(folder_to, graph_model.CAPTURE_INFO)
+        if os.path.isfile(info) and not os.path.isfile(info_to):
+            shutil.copyfile(info, info_to)
+        dst = os.path.join(folder_to, new_name)
+        if not os.path.isfile(dst):
+            shutil.copyfile(src, dst)
+            copied += 1
+    return copied
+
+
 def import_images(payload, target_dir):
     u"""꾸러미의 이미지를 목적지 폴더로 가져온다.
 
@@ -170,18 +194,25 @@ def import_images(payload, target_dir):
     for name in names:
         src = os.path.join(source, name)
         if not os.path.isfile(src):
-            notes.append(("err", u"원본 이미지가 없습니다: %s" % name))
+            if graph_model.image_family(source, name):
+                copied += _copy_variants(source, target_dir, name, name)
+            else:
+                notes.append(("err", u"원본 이미지가 없습니다: %s" % name))
             continue
         dst = os.path.join(target_dir, name)
+        final = name
         if os.path.isfile(dst):
             if _same_bytes(src, dst):
-                continue          # 이미 같은 그림이 있다
+                # 이미 같은 그림이 있다
+                copied += _copy_variants(source, target_dir, name, name)
+                continue
             renamed = _free_name(target_dir, name)
             if renamed is None:
                 notes.append(("err",
                               u"이름이 겹쳐 가져오지 못했습니다: %s" % name))
                 continue
             dst = os.path.join(target_dir, renamed)
+            final = renamed
             mapping[name] = renamed
             notes.append(("info",
                           u"이름이 겹쳐 다른 이름으로 가져왔습니다: %s -> %s"
@@ -191,7 +222,7 @@ def import_images(payload, target_dir):
             if folder and not os.path.isdir(folder):
                 os.makedirs(folder)
             shutil.copyfile(src, dst)
-            copied += 1
+            copied += 1 + _copy_variants(source, target_dir, name, final)
         except Exception as exc:
             mapping.pop(name, None)
             notes.append(("err", u"이미지 복사 실패: %s (%s)" % (name, exc)))

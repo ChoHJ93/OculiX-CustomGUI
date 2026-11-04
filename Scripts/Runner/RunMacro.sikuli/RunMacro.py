@@ -18,6 +18,9 @@
 #
 # --pause-file=<경로> 는 편집기가 준다. 그 파일이 있는 동안 노드 사이와 대기
 # 중에 멈춘다 (일시정지). 주지 않으면 확인하지 않는다.
+#
+# --simulate-client=x,y,w,h 와 --simulate-screen=w,h 는 테스트 전용이다. 해상도
+# 대응이 창과 화면을 재는 대신 이 값을 쓴다 (Tools\MacroEditor\scaletest.py).
 
 from sikuli import *
 import sys
@@ -69,6 +72,11 @@ def load_resume(macro_path):
     return steps, None
 
 
+def numbers_in(arg):
+    """`--이름=1,2,3` 의 값을 숫자 목록으로."""
+    return [float(v) for v in arg.split("=", 1)[1].split(",")]
+
+
 def main():
     args = list(sys.argv[1:])
     start_node = None
@@ -81,6 +89,10 @@ def main():
             resume = True
         elif arg.startswith("--pause-file="):
             macro_engine.PAUSE.configure(arg[len("--pause-file="):].strip())
+        elif arg.startswith("--simulate-client="):
+            macro_engine.SCALE.simulate_client = numbers_in(arg)
+        elif arg.startswith("--simulate-screen="):
+            macro_engine.SCALE.simulate_screen = numbers_in(arg)
         else:
             rest.append(arg)
 

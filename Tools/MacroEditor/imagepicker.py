@@ -16,6 +16,7 @@ import shutil
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 
+import graph_model
 import imagecache
 import theme
 
@@ -39,9 +40,17 @@ def scan_images(macro_folder, macros_root):
             path = os.path.join(macro_folder, name)
             if os.path.isfile(path) and _is_image(name):
                 here.append(("here", name, path))
+        # 다른 화면에서 새로 찍어 `@폴더` 에만 있는 이미지도 이 매크로의 것이다
+        known = set(name.lower() for _kind, name, _path in here)
+        for folder in graph_model.capture_folders(macro_folder):
+            for name in sorted(os.listdir(folder)):
+                if _is_image(name) and name.lower() not in known:
+                    known.add(name.lower())
+                    here.append(("here", name, os.path.join(folder, name)))
 
     if macros_root and os.path.isdir(macros_root):
-        for dirpath, _dirs, files in os.walk(macros_root):
+        for dirpath, dirs, files in os.walk(macros_root):
+            dirs[:] = [d for d in dirs if not graph_model.is_image_folder(d)]
             if folder_norm and os.path.normcase(os.path.abspath(dirpath)) == folder_norm:
                 continue
             for name in sorted(files):

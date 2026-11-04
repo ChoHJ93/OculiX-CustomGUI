@@ -30,6 +30,7 @@
     입력에는 여러 링크가 모일 수 있다 (흐름 합류).
 """
 
+import math
 import os
 
 try:                        # Jython 2.7 / CPython 3 양쪽에서 문자열을 가린다
@@ -747,6 +748,7 @@ class Graph(object):
 
         errors.extend(validate_params(self.data))
         errors.extend(validate_handler_decl(self.data, warnings))
+        errors.extend(validate_scaling(self.data))
         # 조건에 종류가 없으면 실행할 때 'unknown condition type: None' 으로
         # 죽는다. 편집기의 AND/OR 목록에는 'None' 이라고만 보여서 왜 안 되는지
         # 알기 어렵다. 검사에서 먼저 잡는다.
@@ -1188,6 +1190,353 @@ def check_handler_refs(macro, base_dir, macro_path=None):
     return errors, warnings
 
 
+# ------------------------------------------------------- 해상도 대응 (scaling)
+#
+# 매크로의 좌표와 이미지는 **기준 환경**에서 만든 값이고 그대로 저장한다.
+# 다른 해상도에서는 실행할 때 변환하고, 그 환경에서 찍은 값은 저장할 때 기준
+# 값으로 되돌린다. 해상도별 사본을 두면 수정할 때마다 갈라지기 때문이다.
+#
+#     최상위 매크로 settings
+#       "scaling": {
+#         "window": {"class": "UnityWndClass", "title": "마비노기 모바일"},
+#         "client": [1, 30, 1364, 1072],     기준 창의 안쪽 (OculiX 좌표)
+#         "screen": [2048, 1152]             기준 주 모니터 (OculiX 좌표)
+#       }
+#
+# 배율의 기준은 모니터가 아니라 **창의 안쪽**이다. 게임은 창 크기에 맞춰 그리고,
+# OculiX 좌표는 Windows 배율이 적용된 논리 좌표라서, 모니터 해상도만으로는
+# 배율이 나오지 않는다 (2560x1440 @125% -> 1920x1080 @100% 는 0.75 가 아니라 0.93).
+#
+# 좌표 공간은 두 가지다. 게임 창과 달리 실행기, 작업 표시줄, UAC 는 Windows
+# 배율로 크기가 정해져서 논리 크기가 해상도와 상관없이 같다.
+#     window   창 안쪽 기준으로 변환하고 이미지도 줄인다 (기본)
+#     screen   화면 크기에 비례해 자리만 옮기고 이미지는 그대로 쓴다
+#
+# `space` 를 settings 가 아니라 최상위에 두는 이유는 `handlers` 와 같다 -
+# 하위 매크로는 자기 settings 를 갖지 않는다.
+
+SPACE_WINDOW = "window"
+SPACE_SCREEN = "screen"
+SPACES = (SPACE_WINDOW, SPACE_SCREEN)
+
+# 이 값 이하로 다르면 같은 크기로 본다. 엔진은 물리값을 배율로 나눠서
+# 1364.0x1072.8 을 얻고 편집기는 1364x1072 를 얻는다. 기준 환경에서 이 차이로
+# 변환이 켜지면 안 된다.
+SAME_RECT_SLACK = 2
+
+# 변환할 때 검색 영역을 사방으로 넓히는 값(px). 창의 가로세로비가 살짝 달라지면
+# UI 가 최대 1.8px 어긋났다 (1364x1072 -> 1278x1000 실측).
+REGION_PAD = 4
+
+# 가로세로비가 이 비율 넘게 달라지면 경고한다. 그만큼 UI 배치가 비례를 벗어난다.
+ASPECT_WARN = 0.02
+
+# 그 화면 크기에서 다시 찍은 이미지를 두는 폴더의 접두사 (`@1920x1080`).
+# 화면 크기로 짓는 이유: 실행기 단계에는 게임 창이 아직 없다.
+CAPTURE_PREFIX = "@"
+CAPTURE_INFO = "capture.json"
+
+# 엔진이 만든 축소본. 지워도 다시 만든다.
+SCALED_FOLDER = ".scaled"
+
+
+def _rounded(value):
+    """반올림. 파이썬 3 의 round() 는 짝수 쪽으로 가서 2.7 과 값이 다르다.
+
+    편집기와 엔진이 같은 값을 내야 하므로 직접 한다.
+    """
+    return int(math.floor(float(value) + 0.5))
+
+
+def same_size(a, b, slack=SAME_RECT_SLACK):
+    """두 크기 (w, h) 가 사실상 같은가."""
+    return (abs(float(a[0]) - float(b[0])) <= slack
+            and abs(float(a[1]) - float(b[1])) <= slack)
+
+
+class Transform(object):
+    """기준 사각형에서 현재 사각형으로 좌표와 크기를 옮긴다.
+
+    `scales_content` 는 사각형 안의 내용물(이미지, 오프셋)도 함께 줄어드는가다.
+    게임 창은 그렇고, 화면(실행기, 작업 표시줄)은 자리만 옮겨 간다.
+
+    두 사각형이 사실상 같으면 `identity` 이고 값을 그대로 돌려준다.
+    크기만 같고 위치가 다르면 `resized` 가 거짓이고 좌표만 옮긴다.
+    """
+
+    def __init__(self, reference, current, scales_content=True):
+        self.reference = [float(v) for v in reference]
+        self.current = [float(v) for v in current]
+        self.rx, self.ry, self.rw, self.rh = self.reference
+        self.cx, self.cy, self.cw, self.ch = self.current
+        # 크기가 사실상 같으면 배율은 정확히 1 이다. 스냅으로 옮겨 가는 창을
+        # 재면 1364x1072.8 이 나오는데, 이것을 1.0007 배로 치면 같은 크기의
+        # 축소본이 생긴다 (실제 실행에서 637x483 -> 637x483 이 만들어졌다).
+        self.resized = not same_size(self.reference[2:], self.current[2:])
+        self.sx = self.cw / self.rw if self.resized else 1.0
+        self.sy = self.ch / self.rh if self.resized else 1.0
+        # 게임 UI 는 가로와 세로의 기하평균으로 줄어든다. 가로세로비가 조금
+        # 다른 창에서 실측한 UI 배율 0.7475 와 이 값 0.7476 이 일치했다.
+        self.scale = math.sqrt(self.sx * self.sy)
+        self.scales_content = scales_content
+        self.identity = True
+        for a, b in zip(self.reference, self.current):
+            if abs(a - b) > SAME_RECT_SLACK:
+                self.identity = False
+
+    def _x(self, x):
+        return self.cx + (float(x) - self.rx) * self.sx
+
+    def _y(self, y):
+        return self.cy + (float(y) - self.ry) * self.sy
+
+    def point(self, point):
+        """기준 좌표 -> 현재 좌표."""
+        if self.identity:
+            return [int(point[0]), int(point[1])]
+        return [_rounded(self._x(point[0])), _rounded(self._y(point[1]))]
+
+    def inverse_point(self, point):
+        """현재 좌표 -> 기준 좌표. 편집기가 찍은 값을 저장할 때 쓴다."""
+        if self.identity:
+            return [int(point[0]), int(point[1])]
+        return [_rounded(self.rx + (float(point[0]) - self.cx) / self.sx),
+                _rounded(self.ry + (float(point[1]) - self.cy) / self.sy)]
+
+    def region(self, region, bounds=None):
+        """기준 영역 -> 현재 영역. `bounds` [x, y, w, h] 안으로 자른다.
+
+        안쪽으로 줄어들지 않게 바깥쪽으로 올림하고 사방으로 넓힌다.
+        영역이 템플릿보다 작아지면 대상이 있어도 찾지 못한다.
+        """
+        x, y, w, h = [float(v) for v in region]
+        if self.identity:
+            return [int(x), int(y), int(w), int(h)]
+        left = int(math.floor(self._x(x))) - REGION_PAD
+        top = int(math.floor(self._y(y))) - REGION_PAD
+        right = int(math.ceil(self._x(x + w))) + REGION_PAD
+        bottom = int(math.ceil(self._y(y + h))) + REGION_PAD
+        if bounds:
+            bx, by, bw, bh = [int(v) for v in bounds]
+            left = max(left, bx)
+            top = max(top, by)
+            right = min(right, bx + bw)
+            bottom = min(bottom, by + bh)
+        return [left, top, max(1, right - left), max(1, bottom - top)]
+
+    def inverse_region(self, region):
+        """현재 영역 -> 기준 영역. 편집기가 찍은 값을 저장할 때 쓴다."""
+        x, y, w, h = [float(v) for v in region]
+        left, top = self.inverse_point((x, y))
+        right, bottom = self.inverse_point((x + w, y + h))
+        return [left, top, right - left, bottom - top]
+
+    def offset(self, offset):
+        """찾은 자리에서 떨어진 거리. 내용물과 함께 줄어든다."""
+        if not self.resized or not self.scales_content:
+            return [int(offset[0]), int(offset[1])]
+        return [_rounded(float(offset[0]) * self.sx),
+                _rounded(float(offset[1]) * self.sy)]
+
+    def image_size(self, width, height):
+        """템플릿의 새 크기. **반올림**이어야 한다.
+
+        OculiX 의 Pattern.resize 는 소수점을 버린다. 341x61 을 0.9349 배 하면
+        318.8 이 318 이 되어 점수가 0.9104 로 떨어지고, 319 로 반올림하면
+        0.9653 이다 (실제 렌더링에서 측정). 폭 1px 이 점수 0.05 를 좌우한다.
+        """
+        return (max(1, _rounded(float(width) * self.scale)),
+                max(1, _rounded(float(height) * self.scale)))
+
+    def aspect_drift(self):
+        """가로세로비가 기준에서 벗어난 비율."""
+        return abs((self.cw / self.ch) / (self.rw / self.rh) - 1.0)
+
+    def size_key(self):
+        """축소본 폴더 이름에 쓰는 현재 크기 (`1278x1000`)."""
+        return "%dx%d" % (_rounded(self.cw), _rounded(self.ch))
+
+    def describe(self):
+        if not self.resized:
+            return u"창 위치만 다릅니다 (%d,%d) -> (%d,%d). 좌표만 옮깁니다" % (
+                _rounded(self.rx), _rounded(self.ry),
+                _rounded(self.cx), _rounded(self.cy))
+        return u"기준 %dx%d -> 현재 %dx%d (가로 %.4f, 세로 %.4f, 이미지 %.4f)" % (
+            _rounded(self.rw), _rounded(self.rh), _rounded(self.cw),
+            _rounded(self.ch), self.sx, self.sy, self.scale)
+
+
+def screen_view(spec, size):
+    """화면 공간의 변환. 자리만 비례해서 옮긴다."""
+    reference = spec["screen"]
+    return Transform([0, 0, reference[0], reference[1]],
+                     [0, 0, size[0], size[1]], scales_content=False)
+
+
+def scaling_of(macro):
+    """매크로의 해상도 대응 설정. 없으면 None (변환을 전혀 하지 않는다)."""
+    settings = macro.get("settings") if isinstance(macro, dict) else None
+    spec = (settings or {}).get("scaling")
+    return spec if isinstance(spec, dict) else None
+
+
+def _numbers(value, count):
+    """숫자 count 개짜리 목록인가."""
+    if not isinstance(value, (list, tuple)) or len(value) != count:
+        return False
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            return False
+    return True
+
+
+def validate_scaling(macro):
+    """해상도 대응 선언을 검사한다. 오류 목록을 반환."""
+    problems = []
+    if not isinstance(macro, dict):
+        return problems
+    if macro.get("space") not in (None, "") + SPACES:
+        problems.append(u"좌표 기준(space)은 %s 중 하나여야 합니다 (지금 %r)"
+                        % (u"/".join(SPACES), macro.get("space")))
+    settings = macro.get("settings") or {}
+    if "scaling" not in settings:
+        return problems
+    spec = settings["scaling"]
+    if not isinstance(spec, dict):
+        problems.append(u"해상도 대응(scaling) 설정의 형식이 잘못됐습니다: %r"
+                        % (spec,))
+        return problems
+    window = spec.get("window")
+    if not isinstance(window, dict) or not (window.get("class")
+                                            or window.get("title")):
+        problems.append(u"해상도 대응: 기준 창의 class 나 title 이 필요합니다")
+    client = spec.get("client")
+    if not _numbers(client, 4) or client[2] <= 0 or client[3] <= 0:
+        problems.append(u"해상도 대응: 기준 창 안쪽(client)은 "
+                        u"[x, y, w, h] 여야 합니다: %r" % (client,))
+    screen = spec.get("screen")
+    if not _numbers(screen, 2) or screen[0] <= 0 or screen[1] <= 0:
+        problems.append(u"해상도 대응: 기준 화면(screen)은 [w, h] 여야 합니다: "
+                        u"%r" % (screen,))
+    return problems
+
+
+def capture_folder_name(size):
+    """그 화면 크기에서 찍은 이미지를 두는 폴더 이름."""
+    return "%s%dx%d" % (CAPTURE_PREFIX, int(size[0]), int(size[1]))
+
+
+def is_image_folder(name):
+    """매크로 폴더 안에서 이미지 변종을 담는 폴더 이름인가."""
+    return name == SCALED_FOLDER or name.startswith(CAPTURE_PREFIX)
+
+
+def capture_folders(base_dir):
+    """`@...` 폴더의 절대 경로 목록."""
+    try:
+        names = sorted(os.listdir(base_dir))
+    except OSError:
+        return []
+    return [os.path.join(base_dir, name) for name in names
+            if name.startswith(CAPTURE_PREFIX)
+            and os.path.isdir(os.path.join(base_dir, name))]
+
+
+def read_capture_client(folder):
+    """이 `@` 폴더의 이미지를 찍을 때의 창 안쪽. 모르면 None."""
+    import json
+    try:
+        handle = open(os.path.join(folder, CAPTURE_INFO), "rb")
+        try:
+            data = json.loads(handle.read().decode("utf-8"))
+        finally:
+            handle.close()
+    except Exception:
+        return None
+    client = data.get("client") if isinstance(data, dict) else None
+    return client if _numbers(client, 4) else None
+
+
+def write_capture_info(folder, screen, client=None):
+    """`@` 폴더의 안내 파일을 쓴다. 창을 못 쟀으면 아는 값을 지우지 않는다."""
+    import json
+    if not os.path.isdir(folder):
+        os.makedirs(folder)
+    if client is None:
+        client = read_capture_client(folder)
+    data = {"screen": [int(screen[0]), int(screen[1])]}
+    if client is not None:
+        data["client"] = [float(v) for v in client]
+    handle = open(os.path.join(folder, CAPTURE_INFO), "wb")
+    try:
+        handle.write(json.dumps(data, indent=2).encode("utf-8"))
+    finally:
+        handle.close()
+
+
+def locate_image(base_dir, name, screen_size=None):
+    """이 이름으로 쓸 이미지 파일을 찾는다. 없으면 None.
+
+    순서
+      1. 지금 화면 크기의 `@폴더` - 그 환경에서 찍은 것이 가장 잘 맞는다
+      2. 매크로 폴더 바로 아래 - 기준 환경에서 찍은 것
+      3. 다른 `@폴더` - 다른 환경에서 새로 찍어 기준 이미지가 없는 경우
+
+    반환 {"path": 경로, "capture": 기준 이미지면 False, "client": 찍을 때의 창}
+    """
+    if os.path.isabs(name):
+        if os.path.isfile(name):
+            return {"path": name, "capture": False, "client": None}
+        return None
+    if screen_size:
+        folder = os.path.join(base_dir, capture_folder_name(screen_size))
+        path = os.path.join(folder, name)
+        if os.path.isfile(path):
+            return {"path": path, "capture": True,
+                    "client": read_capture_client(folder)}
+    path = os.path.join(base_dir, name)
+    if os.path.isfile(path):
+        return {"path": path, "capture": False, "client": None}
+    for folder in capture_folders(base_dir):
+        path = os.path.join(folder, name)
+        if os.path.isfile(path):
+            return {"path": path, "capture": True,
+                    "client": read_capture_client(folder)}
+    return None
+
+
+def image_family(base_dir, name):
+    """이 이름의 이미지 파일 전부 (기준 + 각 `@폴더`). 있는 것만 준다."""
+    found = []
+    path = os.path.join(base_dir, name)
+    if os.path.isfile(path):
+        found.append(path)
+    for folder in capture_folders(base_dir):
+        path = os.path.join(folder, name)
+        if os.path.isfile(path):
+            found.append(path)
+    return found
+
+
+def base_image_path(path):
+    """`@폴더` 안의 이미지면 매크로 폴더 바로 아래의 경로로 바꿔 준다.
+
+    노드는 이미지를 이름으로만 참조한다. 사용처를 찾거나 노드에 지정할 때는
+    어느 변종을 골랐든 같은 이미지다.
+    """
+    folder, name = os.path.split(path)
+    if os.path.basename(folder).startswith(CAPTURE_PREFIX):
+        return os.path.join(os.path.dirname(folder), name)
+    return path
+
+
+def scaled_image_path(base_dir, name, view):
+    """엔진이 만든 축소본의 경로."""
+    if os.path.isabs(name):
+        name = os.path.basename(name)
+    return os.path.join(base_dir, SCALED_FOLDER, view.size_key(), name)
+
+
 # --------------------------------------------------------------- 파라미터 검증
 
 def validate_node_params(nodes, cautions=None):
@@ -1200,6 +1549,11 @@ def validate_node_params(nodes, cautions=None):
     for node in nodes:
         ntype = node.get("type")
         where = u"노드 %s(%s)" % (node.get("id", "?"), ntype)
+        for spot in [node] + _all_conditions(node):
+            if spot.get("space") not in (None, "") + SPACES:
+                problems.append(u"%s: 좌표 기준(space)은 %s 중 하나여야 합니다 "
+                                u"(지금 %r)" % (where, u"/".join(SPACES),
+                                                spot.get("space")))
         if ntype in ("waitImage", "waitVanish") and not node.get("image"):
             problems.append(u"%s: 이미지가 필요합니다" % where)
         if ntype == "waitText" and not node.get("text"):

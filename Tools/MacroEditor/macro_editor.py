@@ -169,6 +169,8 @@ class ConditionEditor(ttk.Frame):
         body.pack(fill="x", padx=(14, 0), pady=(4, 0))
 
         for field in schema.CONDITION_TYPES[ctype]["fields"]:
+            if not self.app.field_visible(field):
+                continue
             if field["type"] == "condition":
                 sub = ttk.LabelFrame(body, text=field["label"])
                 sub.pack(fill="x", pady=3)
@@ -1489,6 +1491,7 @@ class MacroEditorApp(object):
         if not folder:
             self.status.set(u"매크로를 먼저 저장해야 이미지를 지정할 수 있습니다")
             return
+        path = graph_model.base_image_path(path)
         in_folder = os.path.normcase(os.path.dirname(os.path.abspath(path))) == \
             os.path.normcase(os.path.abspath(folder))
         if in_folder:
@@ -1517,7 +1520,9 @@ class MacroEditorApp(object):
 
     def find_image_users(self, path):
         """이 이미지 파일을 참조하는 (매크로 경로, 단계 id) 목록."""
-        target = os.path.normcase(os.path.abspath(path))
+        # 노드는 이름으로 참조한다. `@폴더` 의 변종이라도 사용처는 같다
+        target = os.path.normcase(os.path.abspath(
+            graph_model.base_image_path(path)))
         users = []
         for _ref, _name, macro_path in graph_model.list_macros(
                 MACROS_DIR, include_subs=True):
@@ -2154,12 +2159,16 @@ class MacroEditorApp(object):
                                                u"이만큼 떨어진 곳을 잡는다. "
                                                u"좌표를 직접 준 경우에는 쓰이지 "
                                                u"않는다"}, sub)
-            else:
+            elif self.field_visible(field):
                 self.build_field(body, field, step)
 
         ttk.Separator(body, orient="horizontal").pack(fill="x", pady=8)
         for field in schema.COMMON_FIELDS:
             self.build_field(body, field, step)
+
+    def field_visible(self, field):
+        """좌표 기준은 해상도 대응을 쓰는 매크로에서만 뜻이 있다."""
+        return field["name"] != "space" or self.macro.scaling is not None
 
     def _set_step_value(self, step, name, value):
         step[name] = value
@@ -2605,7 +2614,7 @@ class MacroEditorApp(object):
 
         elif ftype == "point":
             ttk.Button(row, text=u"찍기", width=6,
-                       command=lambda: self._pick_point(var, commit)
+                       command=lambda: self._pick_point(var, commit, target)
                        ).pack(side="left", padx=(4, 0))
 
         elif ftype == "points":
@@ -2615,11 +2624,14 @@ class MacroEditorApp(object):
                     lambda: pickers.pick_point(self.root))
                 if not point:
                     return
+                stored = self._stored_point(point, target)
+                if stored is None:
+                    return
                 try:
                     current = self._text_to_value("points", var.get() or "")
                 except ValueError:
                     current = []          # 손으로 잘못 적어 뒀으면 새로 시작한다
-                current.append([point[0], point[1]])
+                current.append([stored[0], stored[1]])
                 var.set(self._value_to_text(current))
                 commit()
                 self._warn_if_offscreen(point)
@@ -2638,19 +2650,22 @@ class MacroEditorApp(object):
                 result = pickers.pick_color(self.root)
                 if not result:
                     return
+                stored = self._stored_point(result["point"], target)
+                if stored is None:
+                    return
                 var.set(self._value_to_text(result["rgb"]))
                 commit()
                 self._paint_swatch(swatch, result["rgb"])
                 # 좌표 필드가 같이 있으면 함께 채워준다
                 if "point" in target or True:
-                    target["point"] = result["point"]
+                    target["point"] = list(stored)
                     self.mark_dirty()
                     self.build_properties()
             ttk.Button(row, text=u"찍기", width=6, command=pick).pack(side="left", padx=(2, 0))
 
         elif ftype == "region":
             ttk.Button(row, text=u"드래그", width=7,
-                       command=lambda: self._pick_region(var, commit)
+                       command=lambda: self._pick_region(var, commit, target)
                        ).pack(side="left", padx=(4, 0))
 
     @staticmethod
@@ -2744,21 +2759,209 @@ class MacroEditorApp(object):
             except tk.TclError:
                 pass
 
-    def _pick_point(self, var, commit):
+    def _pick_point(self, var, commit, target=None):
         point = self.run_with_window_hidden(
             lambda: pickers.pick_point(self.root))
         if point:
-            var.set("%d, %d" % point)
+            stored = self._stored_point(point, target)
+            if stored is None:
+                return
+            var.set("%d, %d" % tuple(stored))
             commit()
             self._warn_if_offscreen(point)
 
-    def _pick_region(self, var, commit):
+    def _pick_region(self, var, commit, target=None):
         region = self.run_with_window_hidden(
             lambda: pickers.pick_region(self.root))
         if region:
-            var.set("%d, %d, %d, %d" % region)
+            stored = self._stored_region(region, target)
+            if stored is None:
+                return
+            var.set("%d, %d, %d, %d" % tuple(stored))
             commit()
             self._warn_if_offscreen(region[:2])
+
+    # ------------------------------------------------------------ 해상도 대응
+
+    def _coordinate_view(self, target=None):
+        """찍은 값을 저장 값(기준 좌표)으로 되돌릴 변환. (변환, 문제) 를 준다.
+
+        변환이 None 이면 찍은 값을 그대로 저장한다. 문제가 있으면 저장하면
+        안 된다 - 변환 없이 넣으면 틀린 값이 조용히 기준 좌표로 들어간다.
+
+        노드의 조각(드래그의 시작/끝)은 `space` 를 노드에 두므로 선택된 노드도 본다.
+        """
+        spec = self.macro.scaling
+        if not spec:
+            return None, None
+        selected = self.current_step_obj or {}
+        space = ((target or {}).get("space") or selected.get("space")
+                 or self.macro.data.get("space") or graph_model.SPACE_WINDOW)
+        screen = screenutil.logical_screen_size()
+        if space == graph_model.SPACE_SCREEN:
+            return graph_model.screen_view(spec, screen), None
+        client = screenutil.game_client(spec["window"])
+        if client is not None:
+            return graph_model.Transform(spec["client"], client), None
+        if graph_model.same_size(screen, spec["screen"]):
+            return None, None     # 기준 환경. 게임을 안 띄운 채 고치는 경우다
+        return None, (u"게임 창을 찾지 못해 찍은 값을 기준 좌표로 바꿀 수 "
+                      u"없습니다. 게임을 띄운 뒤 다시 찍어 주세요")
+
+    def _refuse_stored(self, problem):
+        self.log_line(problem, "err")
+        self.status.set(problem)
+
+    def _stored_point(self, point, target=None):
+        """찍은 좌표를 저장할 값으로. 저장하면 안 되면 None."""
+        view, problem = self._coordinate_view(target)
+        if problem:
+            self._refuse_stored(problem)
+            return None
+        if view is None or view.identity:
+            return tuple(point)
+        stored = tuple(view.inverse_point(point))
+        self.log_line(u"찍은 좌표 %s -> 저장 값 %s (기준 좌표)"
+                      % (tuple(point), stored), "info")
+        return stored
+
+    def _stored_region(self, region, target=None):
+        """찍은 영역을 저장할 값으로. 저장하면 안 되면 None."""
+        view, problem = self._coordinate_view(target)
+        if problem:
+            self._refuse_stored(problem)
+            return None
+        if view is None or view.identity:
+            return tuple(region)
+        stored = tuple(view.inverse_region(region))
+        self.log_line(u"찍은 영역 %s -> 저장 값 %s (기준 좌표)"
+                      % (tuple(region), stored), "info")
+        return stored
+
+    def _capture_destination(self, filename):
+        """캡처를 저장할 경로.
+
+        기준 화면에서는 매크로 폴더에 바로 둔다. 다른 화면에서는 `@가로x세로`
+        폴더에 둔다 - 같은 이름의 기준 이미지를 덮어쓰면 기준 환경이 망가진다.
+        """
+        folder = self.resource_dir()
+        spec = self.macro.scaling
+        if not spec:
+            return os.path.join(folder, filename)
+        screen = screenutil.logical_screen_size()
+        client = screenutil.game_client(spec["window"])
+        if graph_model.same_size(screen, spec["screen"]):
+            if client is not None and not graph_model.Transform(
+                    spec["client"], client).identity:
+                self.log_line(u"주의: 게임 창이 기준 크기가 아닙니다. 이 캡처는 "
+                              u"기준 이미지로 저장되므로 배율이 어긋납니다", "err")
+            return os.path.join(folder, filename)
+        target = os.path.join(folder, graph_model.capture_folder_name(screen))
+        graph_model.write_capture_info(target, screen, client)
+        return os.path.join(target, filename)
+
+    def _scaling_text(self, spec):
+        """이 해상도 대응 설정의 지금 상태를 설명하는 글."""
+        if not spec:
+            return u"꺼짐 - 좌표와 이미지를 저장된 값 그대로 씁니다."
+        window = spec["window"]
+        lines = [u"기준 창: %s" % (window.get("title") or window.get("class")),
+                 u"기준 화면 %d x %d, 창 안쪽 %d x %d"
+                 % (spec["screen"][0], spec["screen"][1],
+                    spec["client"][2], spec["client"][3])]
+        client = screenutil.game_client(window)
+        if client is None:
+            lines.append(u"지금 기준 창을 찾을 수 없습니다.")
+        else:
+            view = graph_model.Transform(spec["client"], client)
+            lines.append(u"지금: 기준과 같은 크기" if view.identity
+                         else u"지금: %s" % view.describe())
+        return u"\n".join(lines)
+
+    def _scaling_warnings(self):
+        """매크로 검사에 보탤 경고."""
+        spec = self.macro.scaling
+        client = screenutil.game_client(spec["window"]) if spec else None
+        if client is None:
+            return []
+        view = graph_model.Transform(spec["client"], client)
+        if view.aspect_drift() <= graph_model.ASPECT_WARN:
+            return []
+        return [u"게임 창의 가로세로비가 기준과 %.1f%% 다릅니다. 게임 UI 배치가 "
+                u"비례를 벗어나 좌표가 어긋날 수 있습니다"
+                % (view.aspect_drift() * 100)]
+
+    def _build_scaling_editor(self, box, dialog):
+        """매크로 설정의 해상도 대응 칸. [확인] 때 값을 넣을 함수를 돌려준다."""
+        data = self.macro.data
+        _root, editing_sub = self._family_state()
+        pending = {"scaling": self.macro.scaling}
+        state = ttk.Label(box, style="Dim.TLabel", wraplength=420,
+                          justify="left",
+                          text=self._scaling_text(pending["scaling"]))
+        state.pack(anchor="w", pady=(0, 6))
+
+        def show():
+            state.configure(text=self._scaling_text(pending["scaling"]))
+
+        def register():
+            """창을 찍어서 그 창의 지금 크기를 기준으로 삼는다."""
+            dialog.withdraw()
+            try:
+                point = self.run_with_window_hidden(
+                    lambda: pickers.pick_point(self.root))
+            finally:
+                dialog.deiconify()
+            if not point:
+                return
+            found = screenutil.window_at(*point)
+            if found is None:
+                messagebox.showerror(u"기준 창 등록",
+                                     u"그 자리에서 창을 찾지 못했습니다.")
+                return
+            width, height = screenutil.logical_screen_size()
+            pending["scaling"] = {
+                "window": {"class": found["class"], "title": found["title"]},
+                "client": found["client"],
+                "screen": [width, height],
+            }
+            show()
+
+        def clear():
+            pending["scaling"] = None
+            show()
+
+        row = ttk.Frame(box)
+        row.pack(fill="x")
+        button_state = "disabled" if editing_sub else "normal"
+        ttk.Button(row, text=u"기준 창 등록", command=register,
+                   state=button_state).pack(side="left")
+        ttk.Button(row, text=u"해제", command=clear,
+                   state=button_state).pack(side="left", padx=4)
+        if editing_sub:
+            ttk.Label(row, style="Dim.TLabel",
+                      text=u"하위 매크로는 부모 설정을 씁니다").pack(side="left")
+
+        row = ttk.Frame(box)
+        row.pack(fill="x", pady=(6, 0))
+        ttk.Label(row, text=u"이 매크로의 좌표 기준").pack(side="left")
+        labels = [u"게임 창 (창 크기에 맞춰 변환)", u"화면 (자리만 비례, 이미지 그대로)"]
+        combo = ttk.Combobox(row, values=labels, state="readonly", width=30)
+        combo.current(1 if data.get("space") == graph_model.SPACE_SCREEN else 0)
+        combo.pack(side="left", padx=4)
+
+        def apply_scaling():
+            if not editing_sub:
+                settings = data.setdefault("settings", {})
+                if pending["scaling"]:
+                    settings["scaling"] = pending["scaling"]
+                else:
+                    settings.pop("scaling", None)
+            if combo.current() == 1:
+                data["space"] = graph_model.SPACE_SCREEN
+            else:
+                data.pop("space", None)
+        return apply_scaling
 
     def _warn_if_offscreen(self, point):
         w, h = screenutil.logical_screen_size()
@@ -2810,7 +3013,7 @@ class MacroEditorApp(object):
             filename += ".png"
 
         # 하위 매크로의 이미지는 부모 폴더에 저장한다 - 가족이 공유한다
-        dest = os.path.join(self.resource_dir(), filename)
+        dest = self._capture_destination(filename)
 
         def pick_then_capture():
             """영역 선택과 실제 캡처를 **한 번의 숨김 안에서** 끝낸다.
@@ -2842,7 +3045,9 @@ class MacroEditorApp(object):
         if ok:
             var.set(filename)
             commit()
-            self.log_line(u"캡처 저장: %s  영역 %s" % (filename, region), "ok")
+            self.log_line(u"캡처 저장: %s  영역 %s"
+                          % (os.path.relpath(dest, self.resource_dir()), region),
+                          "ok")
             self.status.set(u"캡처 완료: %s" % filename)
             self._warn_if_offscreen(region[:2])
         else:
@@ -3149,7 +3354,9 @@ class MacroEditorApp(object):
             finally:
                 dialog.deiconify()
             if region:
-                region_var.set("%d, %d, %d, %d" % region)
+                stored = self._stored_region(region)
+                if stored is not None:
+                    region_var.set("%d, %d, %d, %d" % tuple(stored))
         ttk.Button(region_row, text=u"드래그", command=pick).pack(side="left", padx=4)
 
         row += 1
@@ -3158,8 +3365,14 @@ class MacroEditorApp(object):
         param_box.grid(row=row, column=0, columnspan=2, sticky="we", pady=(10, 0))
         self._build_param_editor(param_box, dialog)
 
+        row += 1
+        scale_box = ttk.LabelFrame(frame, text=u"해상도 대응", padding=6)
+        scale_box.grid(row=row, column=0, columnspan=2, sticky="we", pady=(10, 0))
+        apply_scaling = self._build_scaling_editor(scale_box, dialog)
+
         def apply_():
             self.macro.data["name"] = name_var.get()
+            apply_scaling()
             for key, _label, kind in fields:
                 text = vars_[key].get().strip()
                 if text == "":
@@ -3440,6 +3653,7 @@ class MacroEditorApp(object):
         warnings.extend(u"이미지 %s (%s): %s" % (name, where, why)
                         for where, name, why
                         in self.macro.risky_images(self.system_dpi()))
+        warnings.extend(self._scaling_warnings())
 
         for w in warnings:
             self.log_line(u"경고: %s" % w, "err")
@@ -3466,8 +3680,9 @@ class MacroEditorApp(object):
             u"  물리 해상도 : %d x %d\n"
             u"  배율        : %.3f\n\n"
             u"마우스로 찍은 좌표는 논리 좌표이고 OculiX와 같은 좌표계입니다.\n"
-            u"화면 캡처는 배율 차이 때문에 OculiX에 맡깁니다."
-            % (lw, lh, pw, ph, sx))
+            u"화면 캡처는 배율 차이 때문에 OculiX에 맡깁니다.\n\n"
+            u"해상도 대응\n%s"
+            % (lw, lh, pw, ph, sx, self._scaling_text(self.macro.scaling)))
 
     def verify_coordinates(self):
         """편집기와 OculiX가 같은 지점을 가리키는지 실제로 대조한다."""

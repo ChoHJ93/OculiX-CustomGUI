@@ -133,6 +133,9 @@ D:\Apps\jdk-21.0.12+8\bin\java.exe -jar D:\Apps\oculixide-4.0.0-windows.jar -r <
 * Windows 11 메모장은 패키지 앱이라 자동화 대상으로 부적합하다
   (`MainWindowHandle`이 0, 세션 복원으로 사용자 문서가 함께 열림).
   검증에는 전용 창 `Scripts\Tests\TestTarget.ps1`을 사용한다.
+* 실행 중인 로그는 목록에 0바이트로 보이고 `latest.log`는 지난 실행의 내용이다.
+  타임스탬프 파일을 공유 모드로 직접 연다 (`Docs\Environment.md` Known Issues 10).
+  Java가 살아 있어도 일시정지일 수 있으니 `Logs\pause-*.flag`도 확인한다.
 * 이 PC는 모니터 4대에 스케일링이 혼재(125% / 150%)한다.
   자동화는 주 모니터 `Screen(0)`으로 한정한다.
   **화면 인덱스 순서는 실행마다 바뀐다.** 주 모니터만 항상 `Screen(0)`이다.
@@ -428,6 +431,28 @@ claim_reward()
   로그의 `Empty page!!` 가 그 신호다.
 * 글자가 자주 바뀌는 자리(숫자, 시간)는 이미지든 글자든 대상으로 삼지 않는다.
 
+## 해상도 대응
+
+상세는 `Docs\Macro-Format.md` 의 해상도 대응 절, 실측은 `Docs\Environment.md`.
+
+* 매크로에는 **기준 좌표만** 저장한다. 해상도별 사본을 만들지 않는다.
+  다른 환경에서는 실행할 때 변환하고, 찍은 값은 저장할 때 되돌린다.
+* 배율의 기준은 모니터가 아니라 **게임 창 안쪽**이다. MBM_Daily 의 기준은
+  화면 전체가 아니라 논리 (1,30) 1364x1072, 왼쪽 2/3 스냅 창이다.
+  2560x1440 @125% -> 1920x1080 @100% 의 배율은 0.75 가 아니라 0.93 이다.
+* 가로세로비가 같아야 비례한다. 16:9 전체 화면은 대응하지 않는다.
+* 게임 창 밖(실행기, 작업 표시줄, UAC)은 `"space": "screen"` 이다.
+  이미지를 줄이면 오히려 틀린다.
+* 템플릿을 줄일 때 `Pattern.resize` 를 쓰지 않는다. 소수점을 버려서 점수가
+  0.05 까지 떨어진다. `Settings.AlwaysResize` 도 같다.
+* 자동 축소는 점수가 보통 0.02~0.03, 크게는 0.06 내려간다. 빠듯한 템플릿은 그 환경에서
+  다시 찍는다.
+* **Windows 배율을 바꾼 뒤에는 게임을 완전히 다시 시작한다.** 게임은 시작할 때의 DPI 를
+  유지하므로, 그대로 두면 창 크기가 예상과 달라진다.
+  편집기가 `@가로x세로` 폴더에 넣으므로 기준 이미지는 다치지 않는다.
+* `settings.scaling` 이 없는 매크로와 기준 환경의 동작은 바꾸지 않는다.
+  이 조건이 깨지면 지금 도는 매크로가 망가진다.
+
 ## Pixel Color 검사
 
 OculiX 기본 기능만으로 원하는 기능이 불편한 경우 Jython에서 Java API를 사용할 수 있다.
@@ -541,12 +566,14 @@ D:\Programming\Oculix-Automation\
 ├─ 매크로 편집기.bat   GUI 편집기 실행 (더블클릭)
 │
 ├─ Scripts\
-│  ├─ Common\        공용 모듈 (pixel_util, macro_engine)
+│  ├─ Common\        공용 모듈 (pixel_util, macro_engine, scale_runtime)
 │  ├─ Runner\        RunMacro.sikuli - 범용 매크로 실행기
 │  └─ Tests\         검증용 .sikuli 및 테스트 대상 창
 │
 ├─ Macros\           매크로 정의. 폴더 하나가 매크로 하나 (macro.json + 이미지)
 │                    폴더 안의 폴더 = 하위 매크로 (부모 전용, 이미지·설정 공유)
+│                    @가로x세로 = 그 화면에서 다시 찍은 이미지
+│                    .scaled = 엔진이 만든 축소본 (지워도 된다)
 │
 ├─ Tools\
 │  └─ MacroEditor\   GUI 편집기 (Python 3 + tkinter, 외부 의존성 없음)
@@ -598,6 +625,9 @@ UE 블루프린트의 *함수*에 해당한다 — 라이브러리 매크로가 
 
 `Scripts\Common\graph_model.py`가 핀 정의와 검증 규칙을 갖고 있고
 편집기와 엔진이 이 파일을 함께 import 한다 (Python 2/3 양쪽 호환 문법으로 작성).
+
+해상도 계산(`Transform`)도 같은 이유로 `graph_model.py`에 있다. 창을 재고
+축소본을 만드는 일처럼 JVM 안에서만 되는 쪽은 `scale_runtime.py`다.
 
 **Jython 주의:** `macro_engine.py`에서 한글이 든 서식 문자열은 반드시 `u"..."` 로
 쓴다. 바이트 문자열에 unicode 인자를 넣으면 latin-1로 디코딩되어 글자가 깨진다.

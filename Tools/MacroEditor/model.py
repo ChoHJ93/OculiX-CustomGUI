@@ -110,6 +110,22 @@ class Macro(object):
             return None
         return graph_model.family_root(self.folder)
 
+    @property
+    def scaling(self):
+        """이 매크로에 적용되는 해상도 대응 설정. 없거나 잘못됐으면 None.
+
+        하위 매크로는 자기 설정을 쓰지 않으므로 부모 것을 읽는다.
+        """
+        data = self.data
+        root = self.resource_folder
+        if root and os.path.normcase(root) != os.path.normcase(self.folder):
+            data = graph_model.read_macro_file(os.path.join(root, "macro.json"))
+        spec = graph_model.scaling_of(data)
+        if spec is None or graph_model.validate_scaling(
+                {"settings": {"scaling": spec}}):
+            return None
+        return spec
+
     # ---------------------------------------------------------------- 경로 조작
 
     @property
@@ -238,7 +254,7 @@ class Macro(object):
         """
         if self.is_graph:
             return []
-        problems = []
+        problems = graph_model.validate_scaling(self.data)
         for path, step, _depth in self.walk():
             stype = step.get("type")
             where = u"단계 %s (%s)" % (format_path(path), stype or u"타입없음")
@@ -310,7 +326,9 @@ class Macro(object):
         for where, name in refs:
             full = name
             if folder and not os.path.isabs(full):
-                full = os.path.join(folder, name)
+                # `@폴더` 에만 있는 이미지도 있는 이미지다
+                found = graph_model.locate_image(folder, name)
+                full = found["path"] if found else os.path.join(folder, name)
             out.append((where, name, full))
         return out
 

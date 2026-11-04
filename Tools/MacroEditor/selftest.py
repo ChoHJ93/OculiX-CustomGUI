@@ -411,6 +411,8 @@ finally:
     shutil.rmtree(_pt, ignore_errors=True)
 
 
+# --------------------------------------------------------------- 해상도 대응
+
 section("저장된 창 위치 (모니터 구성이 바뀌었을 때)")
 
 import screenutil
@@ -455,6 +457,165 @@ check("모니터 정보를 못 얻으면 건드리지 않는다",
 _real = screenutil.work_areas()
 check("실제 모니터의 작업 영역을 읽는다",
       len(_real) >= 1 and _real[0][2] > _real[0][0], "%r" % (_real,))
+
+
+section("해상도 대응")
+
+_ref = [1, 30, 1364, 1072]
+_t = graph_model.Transform(_ref, [1, 31, 1278, 1000])
+check("배율은 창 안쪽 기준", abs(_t.sx - 0.9370) < 0.0001
+      and abs(_t.sy - 0.9328) < 0.0001 and abs(_t.scale - 0.9349) < 0.0001,
+      "%.4f %.4f %.4f" % (_t.sx, _t.sy, _t.scale))
+check("크기가 다르면 변환한다", not _t.identity)
+check("좌표 변환", _t.point((88, 73)) == [83, 71], "%r" % (_t.point((88, 73)),))
+
+_worst = 0
+for _x in range(1, 1365, 37):
+    for _y in range(30, 1102, 41):
+        _back = _t.inverse_point(_t.point((_x, _y)))
+        _worst = max(_worst, abs(_back[0] - _x), abs(_back[1] - _y))
+check("왕복 오차 2px 이내", _worst <= 2, "최대 %d" % _worst)
+
+check("영역은 바깥으로 넓어진다",
+      _t.region([934, 898, 429, 206]) == [871, 836, 411, 201],
+      "%r" % (_t.region([934, 898, 429, 206]),))
+check("영역을 화면 안으로 자른다",
+      _t.region([278, 57, 1171, 1106], [0, 0, 1920, 1080])
+      == [256, 52, 1106, 1028])
+check("화면을 벗어난 영역도 크기가 0 이 되지 않는다",
+      _t.region([3000, 3000, 10, 10], [0, 0, 1920, 1080])[2:] == [1, 1])
+check("영역 역변환", _t.inverse_region(_t.region([500, 500, 100, 100]))
+      [2] > 100, "%r" % (_t.inverse_region(_t.region([500, 500, 100, 100])),))
+check("오프셋도 함께 줄어든다", _t.offset((-96, 158)) == [-90, 147],
+      "%r" % (_t.offset((-96, 158)),))
+
+# 폭을 소수 버림하면 실제 렌더링에서 점수가 0.05 떨어진다 (Pattern.resize 의 문제)
+check("템플릿 크기는 반올림 (1278x1000)", _t.image_size(341, 61) == (319, 57),
+      "%r" % (_t.image_size(341, 61),))
+_t2 = graph_model.Transform(_ref, [1, 38, 1279, 1006])
+check("템플릿 크기는 반올림 (1279x1006)", _t2.image_size(341, 61) == (320, 57),
+      "%r" % (_t2.image_size(341, 61),))
+check("아주 작아도 1px 은 남는다",
+      graph_model.Transform(_ref, [0, 0, 10, 10]).image_size(1, 1) == (1, 1))
+check("가로세로비 차이", abs(_t.aspect_drift() - 0.0044) < 0.0002,
+      "%.4f" % _t.aspect_drift())
+check("축소본 폴더 이름", _t.size_key() == "1278x1000")
+
+_same = graph_model.Transform(_ref, [0.8, 30.4, 1364.0, 1072.8])
+check("물리값을 나눈 소수값도 기준으로 본다", _same.identity)
+check("기준이면 좌표를 건드리지 않는다", _same.point((88, 73)) == [88, 73]
+      and _same.region([1, 2, 3, 4]) == [1, 2, 3, 4]
+      and _same.offset((5, 6)) == [5, 6])
+check("3px 다르면 기준이 아니다",
+      not graph_model.Transform(_ref, [1, 30, 1367, 1072]).identity)
+
+# 스냅으로 옮겨 가는 창. 크기는 같고 위치만 다르다 (실제 실행에서 나온 값)
+_moved = graph_model.Transform(_ref, [100, 200, 1364.0, 1072.8])
+check("창 위치만 다르면 기준이 아니다", not _moved.identity)
+check("창 위치만 다르면 크기가 바뀐 것이 아니다", not _moved.resized)
+check("크기가 같으면 배율은 정확히 1", _moved.sx == 1.0 and _moved.sy == 1.0
+      and _moved.scale == 1.0, "%r %r" % (_moved.sx, _moved.sy))
+check("창 위치만 다르면 좌표만 옮긴다", _moved.point((88, 73)) == [187, 243],
+      "%r" % (_moved.point((88, 73)),))
+check("창 위치만 다르면 오프셋은 그대로다", _moved.offset((-96, 158)) == [-96, 158])
+check("창 위치만 다르면 템플릿 크기도 그대로다",
+      _moved.image_size(637, 483) == (637, 483))
+check("창 위치만 다르면 그렇게 설명한다", u"창 위치만" in _moved.describe())
+check("크기가 다르면 크기가 바뀐 것이다", _t.resized)
+
+_spec = {"window": {"title": "x"}, "client": _ref, "screen": [2048, 1152]}
+_s = graph_model.screen_view(_spec, (1920, 1080))
+check("화면 공간은 화면 크기에 비례한다", _s.point((1000, 500)) == [938, 469],
+      "%r" % (_s.point((1000, 500)),))
+check("화면 공간의 오프셋은 그대로다", _s.offset((-96, 158)) == [-96, 158])
+check("화면 공간은 내용물을 줄이지 않는다", not _s.scales_content)
+check("작업 표시줄 영역이 1080p 화면 안에 들어온다",
+      _s.region([145, 1104, 1607, 48], [0, 0, 1920, 1080])
+      == [131, 1031, 1516, 49])
+
+check("같은 크기 판정", graph_model.same_size((2048, 1152), (2049, 1151))
+      and not graph_model.same_size((1920, 1080), (2048, 1152)))
+
+_macro = {"settings": {"scaling": _spec}}
+check("올바른 설정은 통과", graph_model.validate_scaling(_macro) == [])
+check("설정이 없으면 통과", graph_model.validate_scaling({"settings": {}}) == [])
+check("없으면 scaling_of 는 None",
+      graph_model.scaling_of({"settings": {}}) is None)
+for _bad, _why in (({"client": _ref, "screen": [1, 1]}, "창 지정 없음"),
+                   ({"window": {"title": "x"}, "client": [1, 2, 3],
+                     "screen": [1, 1]}, "client 개수"),
+                   ({"window": {"title": "x"}, "client": [1, 2, 0, 3],
+                     "screen": [1, 1]}, "client 크기 0"),
+                   ({"window": {"title": "x"}, "client": _ref,
+                     "screen": [0, 1]}, "screen 크기 0")):
+    check("잘못된 설정을 잡는다: %s" % _why, len(graph_model.validate_scaling(
+        {"settings": {"scaling": _bad}})) == 1)
+check("잘못된 좌표 기준을 잡는다",
+      len(graph_model.validate_scaling({"space": "moon"})) == 1)
+check("노드의 잘못된 좌표 기준을 잡는다", len(graph_model.validate_node_params(
+    [{"id": "n1", "type": "click", "point": [1, 2], "space": "moon"}])) == 1)
+check("조건의 잘못된 좌표 기준을 잡는다", len(graph_model.validate_node_params(
+    [{"id": "n1", "type": "if", "condition": {
+        "type": "imageExists", "image": "a.png", "space": "moon"}}])) == 1)
+check("올바른 좌표 기준은 통과", graph_model.validate_node_params(
+    [{"id": "n1", "type": "click", "point": [1, 2], "space": "screen"}]) == [])
+
+_it = tempfile.mkdtemp(prefix="scaling_")
+try:
+    def _touch(*parts):
+        path = os.path.join(_it, *parts)
+        if not os.path.isdir(os.path.dirname(path)):
+            os.makedirs(os.path.dirname(path))
+        with open(path, "wb") as out:
+            out.write(b"x")
+        return path
+
+    _base = _touch("a.png")
+    _mine = _touch("@1920x1080", "a.png")
+    _other = _touch("@1536x864", "b.png")
+    graph_model.write_capture_info(os.path.join(_it, "@1920x1080"),
+                                   (1920, 1080), [1, 31, 1278, 1000])
+
+    _found = graph_model.locate_image(_it, "a.png", (1920, 1080))
+    check("이 화면의 @폴더를 먼저 쓴다", _found["path"] == _mine
+          and _found["capture"]
+          and _found["client"] == [1.0, 31.0, 1278.0, 1000.0], "%r" % (_found,))
+    _found = graph_model.locate_image(_it, "a.png", (2048, 1152))
+    check("다른 화면은 기준 이미지를 쓴다", _found["path"] == _base
+          and not _found["capture"])
+    _found = graph_model.locate_image(_it, "a.png")
+    check("화면을 모르면 기준 이미지를 쓴다", _found["path"] == _base)
+    _found = graph_model.locate_image(_it, "b.png", (1920, 1080))
+    check("기준 이미지가 없으면 다른 @폴더를 쓴다", _found["path"] == _other
+          and _found["client"] is None)
+    check("어디에도 없으면 None",
+          graph_model.locate_image(_it, "c.png", (1920, 1080)) is None)
+    check("절대 경로는 그대로", graph_model.locate_image(
+        _it, _base)["path"] == _base)
+
+    check("같은 이름 전부 모은다",
+          graph_model.image_family(_it, "a.png") == [_base, _mine],
+          "%r" % (graph_model.image_family(_it, "a.png"),))
+    check("@폴더 경로를 기준 경로로", graph_model.base_image_path(_mine) == _base)
+    check("기준 경로는 그대로", graph_model.base_image_path(_base) == _base)
+    check("캡처 폴더 판별", graph_model.is_image_folder("@1920x1080")
+          and graph_model.is_image_folder(".scaled")
+          and not graph_model.is_image_folder("Sub"))
+
+    graph_model.write_capture_info(os.path.join(_it, "@1920x1080"),
+                                   (1920, 1080))
+    check("창을 못 쟀으면 아는 값을 지우지 않는다",
+          graph_model.read_capture_client(os.path.join(_it, "@1920x1080"))
+          == [1.0, 31.0, 1278.0, 1000.0])
+    check("축소본 경로", graph_model.scaled_image_path(_it, "a.png", _t)
+          == os.path.join(_it, ".scaled", "1278x1000", "a.png"))
+finally:
+    shutil.rmtree(_it, ignore_errors=True)
+
+_plain_macro = {"name": "t", "steps": [{"type": "log", "message": "x"}]}
+_plain_model = model.Macro()
+_plain_model.data = dict(_plain_macro, settings={"scaling": {"client": [1]}})
+check("트리 형식도 잘못된 설정을 잡는다", len(_plain_model.validate()) >= 1)
 
 
 # --------------------------------------------------------------- 결과

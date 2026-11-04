@@ -1938,7 +1938,8 @@ if _dialogs:
                 _labels.append(w.cget("text"))
             except Exception:
                 pass
-        if isinstance(w, ttk_module.Combobox):
+        if isinstance(w, ttk_module.Combobox) \
+                and "eng" in list(w.cget("values")):
             _combos.append(w)
     check(u"인식 언어 칸이 있다", u"글자 인식 언어" in _labels,
           u"%r" % (_labels,))
@@ -3409,6 +3410,253 @@ check(u"latest.log 는 정리 대상이 아니다",
 check(u"파일 이름에 쓸 수 없는 글자를 바꾼다",
       editor_runlog._safe_name(u'아침/퀘스트:1') == u"아침_퀘스트_1",
       editor_runlog._safe_name(u'아침/퀘스트:1'))
+
+
+# ------------------------------------------------------------- 해상도 대응
+
+section(u"해상도 대응")
+
+import nodeclip as editor_nodeclip
+import pickers as editor_pickers
+import project_panel as editor_panel
+import screenutil as editor_screen
+
+_sc_spec = {"window": {"class": "UnityWndClass", "title": u"게임"},
+            "client": [1, 30, 1364, 1072], "screen": [2048, 1152]}
+_sc_tmp = tempfile.mkdtemp(prefix="scaling_")
+_sc_macros = os.path.join(_sc_tmp, "Macros")
+_sc_main = os.path.join(_sc_macros, "Main")
+_sc_capture = os.path.join(_sc_main, "@1920x1080")
+os.makedirs(_sc_capture)
+os.makedirs(os.path.join(_sc_main, ".scaled", "1278x1000"))
+
+
+def _sc_file(*parts):
+    with open(os.path.join(*parts), "wb") as out:
+        out.write(b"png")
+
+
+_sc_file(_sc_main, "base.png")
+_sc_file(_sc_main, ".scaled", "1278x1000", "base.png")
+_sc_file(_sc_capture, "base.png")
+_sc_file(_sc_capture, "only.png")
+
+_sc_data = graph_model.blank(u"Main")
+_sc_data["settings"]["scaling"] = _sc_spec
+_sc_data["nodes"] = [
+    {"id": "n1", "type": "click", "point": [88, 73], "ui": {"x": 0, "y": 0}},
+    {"id": "n2", "type": "waitImage", "image": "only.png",
+     "ui": {"x": 0, "y": 100}},
+    {"id": "n3", "type": "click", "image": "base.png",
+     "ui": {"x": 0, "y": 200}},
+]
+_sc_data["entry"] = "n1"
+_sc_path = os.path.join(_sc_main, "macro.json")
+with io.open(_sc_path, "w", encoding="utf-8") as _fh:
+    _fh.write(json.dumps(_sc_data, ensure_ascii=False))
+
+_sc_env = {"screen": (1920, 1080), "client": [1, 31, 1278, 1000]}
+_sc_real = (editor_screen.logical_screen_size, editor_screen.game_client,
+            editor_screen.window_at, editor_pickers.pick_point,
+            macro_editor.MACROS_DIR, editor_panel.simpledialog.askstring,
+            mb.askyesno)
+editor_screen.logical_screen_size = lambda: _sc_env["screen"]
+editor_screen.game_client = lambda window: _sc_env["client"]
+macro_editor.MACROS_DIR = _sc_macros
+mb.askyesno = lambda *a, **k: True
+
+try:
+    _plain = model.Macro()
+    check(u"설정이 없으면 Macro.scaling 은 None", _plain.scaling is None)
+    app.macro = _plain
+    check(u"설정이 없으면 찍은 값을 그대로 저장",
+          app._stored_point((83, 71)) == (83, 71))
+    check(u"설정이 없으면 좌표 기준 칸을 숨긴다",
+          not app.field_visible(schema.SPACE_FIELD))
+
+    app.macro = model.Macro.load(_sc_path)
+    app.apply_mode()
+    check(u"Macro.scaling 을 읽는다", app.macro.scaling == _sc_spec)
+    check(u"설정이 있으면 좌표 기준 칸을 보인다",
+          app.field_visible(schema.SPACE_FIELD))
+
+    app.current_step_obj = app.graph.node("n1")
+    app.build_properties()
+    check(u"속성 패널에 좌표 기준이 나온다",
+          _field_widget(app.prop_frame, u"좌표 기준",
+                        (ttk_module.Combobox,)) is not None)
+
+    check(u"다른 환경에서 찍은 좌표를 기준 값으로 되돌린다",
+          app._stored_point((83, 71)) == (89, 73),
+          u"%r" % (app._stored_point((83, 71)),))
+    _stored = app._stored_region((871, 836, 411, 201))
+    _back = graph_model.Transform(_sc_spec["client"],
+                                  _sc_env["client"]).region(_stored)
+    check(u"찍은 영역을 기준 값으로 되돌린다",
+          _stored is not None and abs(_back[0] - 871) <= 6,
+          u"%r -> %r" % (_stored, _back))
+    check(u"화면 공간은 화면 크기로 되돌린다",
+          app._stored_point((938, 469), {"space": "screen"}) == (1001, 500),
+          u"%r" % (app._stored_point((938, 469), {"space": "screen"}),))
+
+    _sc_env["client"] = None
+    check(u"다른 화면에서 창을 못 찾으면 저장을 거부한다",
+          app._stored_point((83, 71)) is None
+          and app._stored_region((1, 2, 3, 4)) is None)
+    _sc_env["screen"] = (2048, 1152)
+    check(u"기준 화면이면 게임 없이도 고칠 수 있다",
+          app._stored_point((83, 71)) == (83, 71))
+    _sc_env["client"] = [1, 30, 1364, 1072]
+    check(u"기준 환경에서는 찍은 값을 그대로 저장한다",
+          app._stored_point((83, 71)) == (83, 71))
+
+    _dest = app._capture_destination("new.png")
+    check(u"기준 화면의 캡처는 매크로 폴더에 저장한다",
+          _dest == os.path.join(_sc_main, "new.png"), _dest)
+
+    _sc_env["screen"] = (1920, 1080)
+    _sc_env["client"] = [1, 31, 1278, 1000]
+    _dest = app._capture_destination("new.png")
+    check(u"다른 화면의 캡처는 @폴더에 저장한다",
+          _dest == os.path.join(_sc_capture, "new.png"), _dest)
+    check(u"찍을 때의 창 크기를 함께 남긴다",
+          graph_model.read_capture_client(_sc_capture)
+          == [1.0, 31.0, 1278.0, 1000.0])
+
+    check(u"@폴더에만 있는 이미지는 없는 이미지가 아니다",
+          app.macro.missing_images() == [],
+          u"%r" % (app.macro.missing_images(),))
+    _sc_names = [label for _k, label, _p in imagepicker.scan_images(
+        _sc_main, _sc_macros)]
+    check(u"이미지 선택 목록에 @폴더 전용 이미지가 나온다",
+          "only.png" in _sc_names, u"%r" % (_sc_names,))
+    check(u"이미지 선택 목록에 같은 이름이 두 번 나오지 않는다",
+          _sc_names.count("base.png") == 1, u"%r" % (_sc_names,))
+    check(u"이미지 선택 목록에 축소본이 나오지 않는다",
+          not any(".scaled" in label for label in _sc_names))
+
+    class _SmallTree(object):
+        def __init__(self):
+            self.rows = []
+
+        def insert(self, parent, _where, text=u"", tags=()):
+            self.rows.append(text)
+            return len(self.rows)
+
+    class _SmallPanel(object):
+        tree = _SmallTree()
+        paths = {}
+        app = app
+        _insert_dir = editor_panel.ProjectPanel._insert_dir
+
+        def refresh(self, _select=None):
+            pass
+
+    _SmallPanel()._insert_dir("", _sc_main)
+    check(u"프로젝트 패널에 축소본 폴더가 나오지 않는다",
+          not any(".scaled" in row for row in _SmallPanel.tree.rows),
+          u"%r" % (_SmallPanel.tree.rows,))
+    check(u"프로젝트 패널에 @폴더는 나온다",
+          any("@1920x1080" in row for row in _SmallPanel.tree.rows))
+
+    check(u"@폴더 변종의 사용처를 찾는다", any(
+        user[1] == "n3" for user in app.find_image_users(
+            os.path.join(_sc_capture, "base.png"))))
+
+    # 다른 매크로로 복사하면 변종도 함께 간다
+    _sc_other = os.path.join(_sc_macros, "Other")
+    os.makedirs(_sc_other)
+    _map, _notes, _count = editor_nodeclip.import_images(
+        {"nodes": [{"type": "click", "image": "base.png"},
+                   {"type": "click", "image": "only.png"}],
+         "sourceDir": _sc_main}, _sc_other)
+    check(u"복사할 때 기준 이미지와 변종을 함께 옮긴다", _count == 3 and all(
+        os.path.isfile(os.path.join(_sc_other, *parts)) for parts in (
+            ("base.png",), ("@1920x1080", "base.png"),
+            ("@1920x1080", "only.png"), ("@1920x1080", "capture.json"))),
+        u"%r %r" % (_count, _notes))
+
+    # 어느 변종을 고쳐도 이름은 함께 바뀐다
+    editor_panel.simpledialog.askstring = lambda *a, **k: u"renamed.png"
+    editor_panel.ProjectPanel._rename(_SmallPanel(),
+                                      os.path.join(_sc_capture, "base.png"))
+    check(u"이름을 바꾸면 기준 이미지와 변종이 함께 바뀐다",
+          os.path.isfile(os.path.join(_sc_main, "renamed.png"))
+          and os.path.isfile(os.path.join(_sc_capture, "renamed.png"))
+          and not os.path.exists(os.path.join(_sc_capture, "base.png")))
+    _saved = json.loads(io.open(_sc_path, encoding="utf-8").read())
+    check(u"노드의 참조도 함께 바뀐다",
+          [n for n in _saved["nodes"] if n["id"] == "n3"][0]["image"]
+          == "renamed.png")
+
+    # 하위 매크로는 부모 설정을 쓴다
+    _sc_sub = os.path.join(_sc_main, "Sub")
+    os.makedirs(_sc_sub)
+    with io.open(os.path.join(_sc_sub, "macro.json"), "w",
+                 encoding="utf-8") as _fh:
+        _fh.write(json.dumps(graph_model.blank(u"Sub"), ensure_ascii=False))
+    _sub_macro = model.Macro.load(os.path.join(_sc_sub, "macro.json"))
+    check(u"하위 매크로는 부모의 해상도 설정을 읽는다",
+          _sub_macro.scaling == _sc_spec)
+
+    # 창을 찍어서 기준으로 등록한다
+    app.macro = model.Macro()
+    app.macro.data.pop("settings", None)
+    app.apply_mode()
+    editor_pickers.pick_point = lambda _parent: (50, 60)
+    editor_screen.window_at = lambda x, y: {
+        "class": "Cls", "title": u"창", "client": [1, 2, 300, 200]}
+
+
+    def _settings_buttons():
+        _before = list(app.root.winfo_children())
+        app.edit_settings()
+        _dialogs = [w for w in app.root.winfo_children()
+                    if w not in _before and isinstance(w, tk.Toplevel)]
+        check(u"설정 대화상자에 해상도 대응 칸이 있어도 열린다",
+              len(_dialogs) == 1)
+        _dialogs[0].grab_release()
+        return {w.cget("text"): w for w in _find_widgets(
+            _dialogs[0], (ttk_module.Button,))}
+
+    _buttons = _settings_buttons()
+    _buttons[u"기준 창 등록"].invoke()
+    _buttons[u"취소"].invoke()
+    check(u"취소하면 등록하지 않는다",
+          "scaling" not in app.macro.data["settings"])
+
+    _buttons = _settings_buttons()
+    _buttons[u"기준 창 등록"].invoke()
+    _buttons[u"확인"].invoke()
+    check(u"찍은 창을 기준으로 등록한다",
+          app.macro.data["settings"].get("scaling") == {
+              "window": {"class": "Cls", "title": u"창"},
+              "client": [1, 2, 300, 200], "screen": [1920, 1080]},
+          u"%r" % (app.macro.data["settings"].get("scaling"),))
+
+    _buttons = _settings_buttons()
+    _buttons[u"해제"].invoke()
+    _buttons[u"확인"].invoke()
+    check(u"해제하면 설정이 사라진다",
+          "scaling" not in app.macro.data["settings"])
+
+    # 검사가 벌어진 가로세로비를 경고한다
+    app.macro.data["settings"]["scaling"] = _sc_spec
+    _sc_env["client"] = [1, 31, 1278, 950]
+    check(u"가로세로비가 벌어지면 검사가 경고한다",
+          any(u"가로세로비" in line for line in app._scaling_warnings()))
+    _sc_env["client"] = [1, 31, 1278, 1000]
+    check(u"비율이 맞으면 경고하지 않는다", app._scaling_warnings() == [])
+    check(u"상태 글이 현재 배율을 보여 준다",
+          u"기준 1364x1072 -> 현재 1278x1000"
+          in app._scaling_text(app.macro.scaling),
+          app._scaling_text(app.macro.scaling))
+finally:
+    (editor_screen.logical_screen_size, editor_screen.game_client,
+     editor_screen.window_at, editor_pickers.pick_point,
+     macro_editor.MACROS_DIR, editor_panel.simpledialog.askstring,
+     mb.askyesno) = _sc_real
+    shutil.rmtree(_sc_tmp, ignore_errors=True)
 
 
 print("")

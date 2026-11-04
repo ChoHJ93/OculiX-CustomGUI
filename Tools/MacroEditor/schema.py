@@ -32,6 +32,15 @@ COMMON_FIELDS = [
              u"무시하고 계속하면 엉뚱한 곳을 클릭할 수 있으니 신중히"},
 ]
 
+# 해상도 대응을 쓰는 매크로에서만 폼에 나온다 (MacroEditorApp.field_visible).
+SPACE_FIELD = {
+    "name": "space", "type": "choice", "label": u"좌표 기준",
+    "options": [("", u"매크로 기본값"), ("window", u"게임 창"),
+                ("screen", u"화면")],
+    "help": u"게임 창 안의 대상은 창 크기에 맞춰 좌표와 이미지가 함께 바뀐다. "
+            u"실행기, 작업 표시줄, UAC 처럼 창 밖의 대상은 '화면' 으로 둔다",
+}
+
 _IMAGE_SEARCH_FIELDS = [
     {"name": "image", "type": "image", "label": u"이미지"},
     {"name": "similarity", "type": "float", "label": u"정확도",
@@ -40,6 +49,7 @@ _IMAGE_SEARCH_FIELDS = [
      "help": u"비우면 매크로 기본값"},
     {"name": "region", "type": "region", "label": u"검색 영역",
      "help": u"좁힐수록 빠르고 오탐이 적다. 비우면 전체 화면"},
+    SPACE_FIELD,
 ]
 
 _CLICK_FIELDS = [
@@ -69,6 +79,7 @@ _CLICK_FIELDS = [
              u"집으면 마우스가 도착할 때쯤 목록이 밀려서 **바로 옆 항목**을 "
              u"누르게 된다. 같은 모양 버튼이 세로로 늘어선 목록이라면 0.4 "
              u"정도부터. 비우면 매크로 기본값(보통 끔)"},
+    SPACE_FIELD,
 ]
 
 
@@ -141,6 +152,7 @@ STEP_TYPES = OrderedDict([
             {"name": "region", "type": "region", "label": u"검색 영역",
              "help": u"**좁힐수록 정확하다.** 화면 전체를 읽으면 글자를 놓치거나 "
                      u"없는 공백이 끼어든다"},
+            SPACE_FIELD,
         ],
     }),
     ("waitColor", {
@@ -154,6 +166,7 @@ STEP_TYPES = OrderedDict([
             {"name": "timeout", "type": "float", "label": u"제한시간(초)"},
             {"name": "interval", "type": "float", "label": u"검사 간격(초)",
              "default": 0.1},
+            SPACE_FIELD,
         ],
     }),
 
@@ -190,6 +203,7 @@ STEP_TYPES = OrderedDict([
                      u"비우면 시작에서 끝으로 곧장 끈다. "
                      u"경유지는 좌표만 쓸 수 있다 - 끄는 도중에는 화면이 "
                      u"바뀌고 있어서 이미지로 찾을 수 없다"},
+            SPACE_FIELD,
         ],
     }),
     ("wheel", {
@@ -202,6 +216,7 @@ STEP_TYPES = OrderedDict([
             {"name": "direction", "type": "choice", "label": u"방향", "default": "down",
              "options": [("down", u"아래로"), ("up", u"위로")]},
             {"name": "amount", "type": "int", "label": u"칸 수", "default": 3},
+            SPACE_FIELD,
         ],
     }),
 
@@ -285,6 +300,7 @@ CONDITION_TYPES = OrderedDict([
             {"name": "similarity", "type": "float", "label": u"정확도"},
             {"name": "timeout", "type": "float", "label": u"제한시간(초)", "default": 3},
             {"name": "region", "type": "region", "label": u"검색 영역"},
+            SPACE_FIELD,
         ],
     }),
     ("imageMissing", {
@@ -294,6 +310,7 @@ CONDITION_TYPES = OrderedDict([
             {"name": "similarity", "type": "float", "label": u"정확도"},
             {"name": "timeout", "type": "float", "label": u"제한시간(초)", "default": 3},
             {"name": "region", "type": "region", "label": u"검색 영역"},
+            SPACE_FIELD,
         ],
     }),
     ("textExists", {
@@ -310,6 +327,7 @@ CONDITION_TYPES = OrderedDict([
             {"name": "timeout", "type": "float", "label": u"제한시간(초)", "default": 3},
             {"name": "region", "type": "region", "label": u"검색 영역",
              "help": u"좁힐수록 정확하다"},
+            SPACE_FIELD,
         ],
     }),
     ("textMissing", {
@@ -325,6 +343,7 @@ CONDITION_TYPES = OrderedDict([
              "help": u"화면 글자를 읽어 찾는다. 한 번에 한 언어만 인식된다 (kor 로는 영문이, eng 로는 한글이 깨진다). 비우면 매크로 설정값"},
             {"name": "timeout", "type": "float", "label": u"제한시간(초)", "default": 3},
             {"name": "region", "type": "region", "label": u"검색 영역"},
+            SPACE_FIELD,
         ],
     }),
     ("colorMatches", {
@@ -333,6 +352,7 @@ CONDITION_TYPES = OrderedDict([
             {"name": "point", "type": "point", "label": u"좌표"},
             {"name": "rgb", "type": "rgb", "label": u"색"},
             {"name": "tolerance", "type": "tolerance", "label": u"허용 오차", "default": 10},
+            SPACE_FIELD,
         ],
     }),
     ("paramCompare", {

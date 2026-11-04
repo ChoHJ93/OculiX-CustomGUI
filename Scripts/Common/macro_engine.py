@@ -36,6 +36,8 @@ import time
 
 import pixel_util
 
+from scale_runtime import SCALE, WindowMissing
+
 
 HARD_ITERATION_CAP = 10000   # last-resort guard against a runaway macro
 
@@ -177,11 +179,14 @@ class Engine(object):
         self.default_settle = float(settings.get("defaultSettle", 0))
 
         self.screen = Screen(self.screen_index)
-        default_region = settings.get("searchRegion")
-        if default_region:
-            self.default_region = self._make_region(default_region)
-        else:
-            self.default_region = self.screen
+        # 기본 검색 영역. 해상도 대응을 쓰면 창이 뜬 뒤에야 계산할 수 있으므로
+        # 쓸 때 Region 으로 만든다.
+        self.search_region = settings.get("searchRegion") or None
+        if self.search_region and len(self.search_region) != 4:
+            raise MacroError("region must be [x, y, w, h], got %r"
+                             % (self.search_region,))
+        # 이 매크로 좌표의 기준. 노드의 `space` 가 있으면 그것이 우선한다.
+        self.space = macro.get("space") or graph_model.SPACE_WINDOW
 
         self.stats = {"steps": 0, "failed": 0}
 
@@ -214,15 +219,49 @@ class Engine(object):
                 line = line.encode("ascii", "replace")
         print(line)
 
-    def _make_region(self, spec):
+    def _view(self, step):
+        """이 단계의 좌표에 쓸 변환. 해상도 대응을 안 쓰면 None.
+
+        창 기준인데 창이 없으면 WindowMissing. 좌표를 계산할 수 없다.
+        """
+        if not SCALE.enabled():
+            return None
+        if (step.get("space") or self.space) == graph_model.SPACE_SCREEN:
+            return SCALE.screen_view()
+        view = SCALE.window_view()
+        if view is None:
+            raise WindowMissing(u"기준 창을 찾을 수 없어 좌표를 계산하지 "
+                                u"못했습니다")
+        return view
+
+    def _map_point(self, point, step):
+        """기준 좌표를 지금 화면의 좌표로. (x, y)"""
+        view = self._view(step)
+        if view is None:
+            return int(point[0]), int(point[1])
+        mapped = view.point(point)
+        return mapped[0], mapped[1]
+
+    def _make_region(self, spec, step):
         if spec is None:
-            return self.default_region
+            spec = self.search_region
+            if spec is None:
+                return self.screen
         if len(spec) != 4:
             raise MacroError("region must be [x, y, w, h], got %r" % (spec,))
+        view = self._view(step)
+        if view is not None:
+            spec = view.region(spec, SCALE.screen_rect())
         return Region(int(spec[0]), int(spec[1]), int(spec[2]), int(spec[3]))
 
-    def _image_path(self, name):
+    def _image_path(self, name, view=None):
         """Images live next to the macro's .json file, like a .sikuli bundle."""
+        if SCALE.enabled():
+            path = SCALE.image_path(self.base_dir, name, view)
+            if path is None:
+                raise MacroError("image not found: %s"
+                                 % os.path.join(self.base_dir, name))
+            return path
         path = name
         if not os.path.isabs(path):
             path = os.path.join(self.base_dir, name)
@@ -235,10 +274,15 @@ class Engine(object):
         if not image:
             raise MacroError("step %r requires 'image'" % step.get("type"))
         similarity = float(step.get("similarity", self.default_similarity))
-        pattern = Pattern(self._image_path(image)).similar(similarity)
+        view = self._view(step)
+        pattern = Pattern(self._image_path(image, view)).similar(similarity)
         offset = step.get("targetOffset")
         if offset:
+            if view is not None:
+                offset = view.offset(offset)
             pattern = pattern.targetOffset(int(offset[0]), int(offset[1]))
+        if SCALE.dpi_fix_needed(view):
+            pattern.getImage().setCaptureDpi(SCALE.system_dpi())
         return pattern
 
     def _timeout(self, step):
@@ -293,11 +337,12 @@ class Engine(object):
     def _sliced(self):
         """대기를 잘라서 기다려야 하는가.
 
-        자른 사이마다 감시와 일시정지를 확인한다. 둘 다 해당 없으면(명령줄
-        실행에 감시도 없는 경우) 예전처럼 한 번에 기다린다.
+        자른 사이마다 감시와 일시정지를 확인한다. 해상도 대응을 쓰면 창 크기도
+        다시 잰다. 모두 해당 없으면(명령줄 실행에 감시도 없는 경우) 예전처럼
+        한 번에 기다린다.
         """
-        return PAUSE.enabled() or (self.watch is not None
-                                   and self.watch.active())
+        return (PAUSE.enabled() or SCALE.enabled()
+                or (self.watch is not None and self.watch.active()))
 
     def _wait_tick(self):
         """대기 중의 끼어들기를 처리한다. 메인이 멈춰 있던 시간(초)을 준다.
@@ -363,14 +408,33 @@ class Engine(object):
 
     def _find(self, step):
         """Locate the step's image. Returns Match or None - never raises."""
-        region = self._make_region(step.get("region"))
+        if SCALE.enabled():
+            return self._watched(self._timeout(step),
+                                 lambda seconds: self._look(step, seconds))
+        region = self._make_region(step.get("region"), step)
         pattern = self._pattern(step)
         return self._watched(self._timeout(step),
                              lambda seconds: region.exists(pattern, seconds))
 
+    def _look(self, step, seconds):
+        """창을 새로 재서 한 번 찾는다. 창이 없으면 그만큼 기다리고 None.
+
+        대기 조각마다 다시 계산한다. 창은 스냅되기 전과 뒤의 크기가 다르고,
+        기다리는 도중에도 움직일 수 있다.
+        """
+        try:
+            region = self._make_region(step.get("region"), step)
+            pattern = self._pattern(step)
+        except WindowMissing:
+            time.sleep(seconds)
+            return None
+        return region.exists(pattern, seconds)
+
     def _find_now(self, step):
         """지금 한 번만 훑는다. 기다리지 않는다."""
-        region = self._make_region(step.get("region"))
+        if SCALE.enabled():
+            return self._look(step, 0)
+        region = self._make_region(step.get("region"), step)
         return region.exists(self._pattern(step), 0)
 
     def _find_at(self, step, match):
@@ -637,7 +701,9 @@ class Engine(object):
         if not query:
             raise MacroError("step %r requires 'text'" % step.get("type"))
         self._set_language(step.get("ocrLanguage") or self._default_language)
-        region = self._make_region(step.get("region"))
+        region = None
+        if not SCALE.enabled():
+            region = self._make_region(step.get("region"), step)
         deadline = time.time() + self._timeout(step)
         while True:
             spent = self._wait_tick()
@@ -646,19 +712,41 @@ class Engine(object):
                 # 감시 매크로가 인식 설정을 바꿔 놓았을 수 있다
                 self._set_language(step.get("ocrLanguage")
                                    or self._default_language)
-            hit = self._scan_text(region, query, for_click)
+            hit = self._read_text(region, step, query, for_click)
             if hit is not None:
                 return hit
             if time.time() >= deadline:
                 return None
             time.sleep(0.3)
 
+    def _read_text(self, region, step, query, for_click):
+        """글자를 한 번 읽는다. 해상도 대응을 쓰면 영역을 매번 다시 계산한다."""
+        if region is None:
+            try:
+                region = self._make_region(step.get("region"), step)
+            except WindowMissing:
+                return None
+        return self._scan_text(region, query, for_click)
+
+    def _region_note(self, step):
+        """로그에 쓸 검색 범위. 변환했으면 저장 값과 실제 값을 함께 쓴다."""
+        spec = step.get("region")
+        if not spec:
+            return u"화면 전체"
+        try:
+            view = self._view(step)
+        except WindowMissing:
+            return u"%s (창 없음)" % (spec,)
+        if view is None or view.identity:
+            return spec
+        return u"%s -> %s" % (spec, view.region(spec, SCALE.screen_rect()))
+
     def _search_note(self, step):
         """어떤 조건으로 찾는지 한 줄로. 실패했을 때 무엇을 조일지 알려 준다."""
         return u"정확도 %.2f 이상, 제한 %.0f초, 범위 %s" % (
             float(step.get("similarity", self.default_similarity)),
             self._timeout(step),
-            step.get("region") or u"화면 전체")
+            self._region_note(step))
 
     def _spot_text(self, target):
         """대상이 가리키는 좌표를 (x,y) 로. 알 수 없으면 (?,?)."""
@@ -732,9 +820,13 @@ class Engine(object):
 
         point = step.get("point")
         if point:
-            self.log(u"    %s좌표 지정 (%d,%d)"
-                     % (head, int(point[0]), int(point[1])))
-            return Location(int(point[0]), int(point[1]))
+            x, y = self._map_point(point, step)
+            if (x, y) == (int(point[0]), int(point[1])):
+                self.log(u"    %s좌표 지정 (%d,%d)" % (head, x, y))
+            else:
+                self.log(u"    %s좌표 지정 (%d,%d) -> (%d,%d)"
+                         % (head, int(point[0]), int(point[1]), x, y))
+            return Location(x, y)
         if not allow_pointer:
             raise MacroError("step %r needs 'image', 'text' or 'point'"
                              % step.get("type"))
@@ -978,8 +1070,8 @@ class Engine(object):
             return self._find_text(probe) is None
 
         if ctype == "colorMatches":
-            point = cond["point"]
-            rgb = pixel_util.get_pixel_rgb(int(point[0]), int(point[1]))
+            x, y = self._map_point(cond["point"], cond)
+            rgb = pixel_util.get_pixel_rgb(x, y)
             return pixel_util.is_color_similar(
                 rgb, tuple(cond["rgb"]), cond.get("tolerance", 10))
 
@@ -1127,11 +1219,9 @@ class Engine(object):
             return True
 
         if stype == "waitVanish":
-            region = self._make_region(step.get("region"))
-            pattern = self._pattern(step)
             gone = self._watched(
                 self._timeout(step),
-                lambda seconds: True if region.waitVanish(pattern, seconds)
+                lambda seconds: True if self._vanished(step, seconds)
                 else None)
             if not gone:
                 self.log("    still visible after %.0fs" % self._timeout(step))
@@ -1167,18 +1257,18 @@ class Engine(object):
             return True
 
         if stype == "drag":
-            src = self._target(step.get("from", {}), label=u"시작")
-            dst = self._target(step.get("to", {}), label=u"끝")
+            src = self._target(self._drag_side(step, "from"), label=u"시작")
+            dst = self._target(self._drag_side(step, "to"), label=u"끝")
             if src is None or dst is None:
                 # 어느 쪽이 안 됐는지 밝힌다. 둘 다 실패로 보이면 엉뚱한 쪽을 고친다.
                 self.log(u"    드래그를 못 합니다 - 시작 %s, 끝 %s"
                          % (u"OK" if src is not None else u"못 찾음",
                             u"OK" if dst is not None else u"못 찾음"))
                 return False
-            waypoints = step.get("waypoints") or []
+            waypoints = [self._map_point(p, step)
+                         for p in step.get("waypoints") or []]
             route = [self._spot_text(src)]
-            route.extend(u"경유 (%d,%d)" % (int(p[0]), int(p[1]))
-                         for p in waypoints)
+            route.extend(u"경유 (%d,%d)" % (p[0], p[1]) for p in waypoints)
             route.append(self._spot_text(dst))
             self.log(u"    끌기 경로: %s" % u" -> ".join(route))
             if not waypoints:
@@ -1222,11 +1312,11 @@ class Engine(object):
             return True
 
         if stype == "waitColor":
-            point = step["point"]
+            x, y = self._map_point(step["point"], step)
             got = self._watched(
                 self._timeout(step),
                 lambda seconds: pixel_util.wait_pixel_color(
-                    int(point[0]), int(point[1]), tuple(step["rgb"]),
+                    x, y, tuple(step["rgb"]),
                     tolerance=step.get("tolerance", 10),
                     timeout=seconds,
                     interval=float(step.get("interval", 0.1))))
@@ -1249,6 +1339,25 @@ class Engine(object):
             raise _Break()
 
         raise MacroError("unknown step type: %r" % stype)
+
+    def _vanished(self, step, seconds):
+        """이미지가 사라졌는가. 창이 없으면 확인할 수 없으므로 아직 아니다."""
+        try:
+            region = self._make_region(step.get("region"), step)
+            pattern = self._pattern(step)
+        except WindowMissing:
+            time.sleep(seconds)
+            return False
+        return region.waitVanish(pattern, seconds)
+
+    @staticmethod
+    def _drag_side(step, key):
+        """드래그의 한쪽 끝. 노드에 준 `space` 를 양 끝이 함께 쓴다."""
+        side = step.get(key, {})
+        if step.get("space") and "space" not in side:
+            side = dict(side)
+            side["space"] = step["space"]
+        return side
 
     def _repeat(self, step):
         steps = step.get("steps", [])
@@ -2311,6 +2420,11 @@ def make_engine(macro, base_dir, logger=None, start_node=None, params=None,
     """
     original = os.path.abspath(os.path.join(base_dir, "macro.json"))
     macro, base_dir, adopted = _adopt_parent_context(macro, base_dir)
+    # 실행 하나에 기준 하나다. 호출된 매크로와 감시 매크로도 이 값을 쓴다.
+    problems = graph_model.validate_scaling(macro)
+    if problems:
+        raise MacroError(u"; ".join(problems))
+    SCALE.configure(graph_model.scaling_of(macro))
     notes = []
     if params is None:
         params, notes = _standalone_params(macro)
@@ -2329,6 +2443,7 @@ def make_engine(macro, base_dir, logger=None, start_node=None, params=None,
         if resume_path:
             raise MacroError("resume is only supported for graph macros")
         engine = Engine(macro, base_dir, logger, params=params)
+    SCALE.attach(engine.log)
     if adopted:
         engine.log(u"하위 매크로 - 부모(%s)의 설정과 이미지 폴더를 사용합니다"
                    % os.path.basename(adopted))

@@ -24,6 +24,20 @@ _gdi32 = ctypes.windll.gdi32
 
 ENUM_CURRENT_SETTINGS = -1
 
+# 64비트에서 창 핸들이 잘리지 않게 형을 정해 둔다.
+_user32.FindWindowW.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR)
+_user32.FindWindowW.restype = wintypes.HWND
+_user32.WindowFromPoint.argtypes = (wintypes.POINT,)
+_user32.WindowFromPoint.restype = wintypes.HWND
+_user32.GetAncestor.argtypes = (wintypes.HWND, wintypes.UINT)
+_user32.GetAncestor.restype = wintypes.HWND
+_user32.GetClientRect.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.RECT))
+_user32.ClientToScreen.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.POINT))
+_user32.GetClassNameW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+_user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+
+GA_ROOT = 2
+
 
 class _DEVMODE(ctypes.Structure):
     _fields_ = [
@@ -180,6 +194,49 @@ def read_pixel(x, y):
     if value == 0xFFFFFFFF:      # CLR_INVALID
         return None
     return (value & 0xFF, (value >> 8) & 0xFF, (value >> 16) & 0xFF)
+
+
+def client_rect(handle):
+    """창 안쪽의 논리 좌표 [x, y, w, h]. 창이 없거나 최소화면 None.
+
+    편집기는 DPI 비인식 프로세스라 Windows 가 논리값으로 바꿔서 준다.
+    이 값이 OculiX 좌표와 같다 (실측: 물리 1,38 1705x1341 -> 1,30 1364x1072).
+    """
+    if not handle:
+        return None
+    rect = wintypes.RECT()
+    if not _user32.GetClientRect(handle, ctypes.byref(rect)):
+        return None
+    if rect.right <= 0 or rect.bottom <= 0:
+        return None
+    origin = wintypes.POINT(0, 0)
+    if not _user32.ClientToScreen(handle, ctypes.byref(origin)):
+        return None
+    return [origin.x, origin.y, rect.right, rect.bottom]
+
+
+def game_client(window):
+    """`settings.scaling.window` 가 가리키는 창의 안쪽. 없으면 None."""
+    if not window:
+        return None
+    return client_rect(_user32.FindWindowW(window.get("class"),
+                                           window.get("title")))
+
+
+def window_at(x, y):
+    """이 지점의 최상위 창. {"class", "title", "client"} 또는 None."""
+    handle = _user32.WindowFromPoint(wintypes.POINT(int(x), int(y)))
+    if not handle:
+        return None
+    handle = _user32.GetAncestor(handle, GA_ROOT) or handle
+    client = client_rect(handle)
+    if client is None:
+        return None
+    kind = ctypes.create_unicode_buffer(256)
+    _user32.GetClassNameW(handle, kind, 256)
+    title = ctypes.create_unicode_buffer(512)
+    _user32.GetWindowTextW(handle, title, 512)
+    return {"class": kind.value, "title": title.value, "client": client}
 
 
 def cursor_position():

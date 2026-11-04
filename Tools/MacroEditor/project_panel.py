@@ -12,6 +12,7 @@ import subprocess
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 
+import graph_model
 import imagecache
 import theme
 
@@ -152,6 +153,8 @@ class ProjectPanel(ttk.Frame):
             return
         for name in entries:
             full = os.path.join(path, name)
+            if name == graph_model.SCALED_FOLDER:
+                continue                # 엔진이 만든 축소본. 손댈 일이 없다
             if os.path.isdir(full):
                 item = self.tree.insert(parent, "end",
                                         text=u"%s %s" % (ICON_FOLDER, name),
@@ -299,10 +302,15 @@ class ProjectPanel(ttk.Frame):
             return
         if not new.lower().endswith(IMAGE_EXT):
             new += os.path.splitext(old)[1]
-        target = os.path.join(os.path.dirname(path), new)
-        if os.path.exists(target):
+        # 노드는 이름으로만 참조하므로 `@폴더` 의 변종도 함께 바꿔야 한다
+        base = graph_model.base_image_path(path)
+        family = graph_model.image_family(os.path.dirname(base), old)
+        renames = [(item, os.path.join(os.path.dirname(item), new))
+                   for item in family or [path]]
+        if any(os.path.exists(after) for _before, after in renames):
             messagebox.showerror(u"이름 변경", u"같은 이름의 파일이 이미 있습니다.")
             return
+        target = os.path.join(os.path.dirname(path), new)
         users = self.app.find_image_users(path)
         if users and not messagebox.askyesno(
                 u"이름 변경",
@@ -310,12 +318,14 @@ class ProjectPanel(ttk.Frame):
                 u"이름을 바꾸면 그 참조도 함께 고칩니다. 계속할까요?" % len(users)):
             return
         try:
-            os.rename(path, target)
+            for before, after in renames:
+                os.rename(before, after)
         except OSError as exc:
             messagebox.showerror(u"이름 변경 실패", str(exc))
             return
-        imagecache.forget(path)
-        self.app.rename_image_references(old, new, path)
+        for before, _after in renames:
+            imagecache.forget(before)
+        self.app.rename_image_references(old, new, base)
         self.refresh(target)
         self.app.log_line(u"이미지 이름 변경: %s -> %s" % (old, new), "ok")
 

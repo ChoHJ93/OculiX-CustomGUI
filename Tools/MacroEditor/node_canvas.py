@@ -34,6 +34,8 @@ import tkinter as tk
 from tkinter import ttk
 from tkinter import font as tkfont
 
+import screenutil
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.normpath(os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "..", "Scripts", "Common")))
@@ -214,8 +216,9 @@ class NodeCanvas(ttk.Frame):
             return name if os.path.isfile(name) else None
         if not self.base_dir:
             return None
-        path = os.path.join(self.base_dir, name)
-        return path if os.path.isfile(path) else None
+        found = graph_model.locate_image(self.base_dir, name,
+                                         screenutil.logical_screen_size())
+        return found["path"] if found else None
 
     def node_image_path(self, node):
         """이 노드의 첫 번째 이미지 절대 경로. 없으면 None."""
