@@ -33,6 +33,11 @@ class MacroError(Exception):
     pass
 
 
+def _encode(data):
+    text = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=False)
+    return text.encode("utf-8") + b"\n"
+
+
 class Macro(object):
 
     def __init__(self, data=None, path=None):
@@ -81,16 +86,53 @@ class Macro(object):
         folder = os.path.dirname(target)
         if folder and not os.path.isdir(folder):
             os.makedirs(folder)
-        text = json.dumps(self.data, ensure_ascii=False, indent=2, sort_keys=False)
+        encoded = _encode(self.data)
         f = open(target, "wb")
         try:
-            f.write(text.encode("utf-8"))
-            f.write(b"\n")
+            f.write(encoded)
         finally:
             f.close()
         self.path = target
         self.dirty = False
         return target
+
+    def store_last_selected(self):
+        """마지막 선택 노드를 파일에 남긴다. 실제로 고쳤으면 True.
+
+        사용자가 저장을 누르지 않아도 불리므로 `self.data` 를 쓰면 안 된다 -
+        저장하지 않은 수정이 딸려 들어간다. 디스크의 내용에서 이 필드만 바꾼다.
+        파일에 아직 없는 노드(저장 안 한 새 노드)는 남기지 않는다.
+
+        Macros 폴더는 버전 관리 밖이라 깨지면 되돌릴 수 없다. 그래서 임시 파일에
+        다 쓴 뒤 교체한다.
+        """
+        node_id = self.data.get(graph_model.LAST_SELECTED)
+        if not node_id or not self.is_graph:
+            return False
+        if not self.path or not os.path.isfile(self.path):
+            return False
+        f = open(self.path, "rb")
+        try:
+            stored = json.loads(f.read().decode("utf-8"))
+        finally:
+            f.close()
+        if stored.get(graph_model.LAST_SELECTED) == node_id:
+            return False
+        if not any(n.get("id") == node_id for n in stored.get("nodes") or []):
+            return False
+        stored[graph_model.LAST_SELECTED] = node_id
+        temp = self.path + ".tmp"
+        try:
+            f = open(temp, "wb")
+            try:
+                f.write(_encode(stored))
+            finally:
+                f.close()
+            os.replace(temp, self.path)
+        finally:
+            if os.path.exists(temp):
+                os.remove(temp)
+        return True
 
     @property
     def folder(self):

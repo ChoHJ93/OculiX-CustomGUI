@@ -179,6 +179,16 @@ class NodeCanvas(ttk.Frame):
         """
         self._selected_node = node_id
         self.selected_nodes = set([node_id]) if node_id else set()
+        self._remember_active()
+
+    def _remember_active(self):
+        """활성 노드를 매크로에 적어 둔다. 선택을 비워도 지우지 않는다.
+
+        `mark_dirty` 를 부르지 않는다 - 클릭만으로 수정됨이 되면 안 된다.
+        파일에는 매크로를 떠날 때 들어간다 (`Macro.store_last_selected`).
+        """
+        if self._selected_node and self.graph is not None:
+            self.graph.last_selected = self._selected_node
 
     def set_selection(self, node_ids, active=None, notify=True):
         """선택 전체를 갈아 끼운다. 활성 노드는 가능하면 유지한다."""
@@ -193,6 +203,7 @@ class NodeCanvas(ttk.Frame):
                     break
         self.selected_nodes = ids
         self._selected_node = active
+        self._remember_active()
         if notify:
             self._notify_active()
 
@@ -1228,6 +1239,19 @@ class NodeCanvas(ttk.Frame):
         if self.graph is None or not self.graph.entry:
             return False
         return self.center_on_node(self.graph.entry)
+
+    def focus_opened(self):
+        """막 연 매크로의 보는 위치를 잡는다. 옮기지 못했으면 False.
+
+        마지막으로 선택한 노드, 그게 없으면(기록이 없거나 지워졌으면) 시작 노드로
+        간다. 노드가 하나도 없으면 둘 다 없으므로 화면은 그대로다.
+        """
+        if self.graph is None:
+            return False
+        target = self.graph.last_selected
+        if self.graph.node(target) is None:
+            target = self.graph.entry
+        return self.center_on_node(target)
 
     def auto_layout(self):
         """시작 노드부터 폭 우선으로 훑어 열/행에 배치한다."""

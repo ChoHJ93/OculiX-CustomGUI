@@ -784,6 +784,7 @@ class MacroEditorApp(object):
             return
         self.current_path = None
         self.apply_mode()
+        self.focus_opened_macro()
         self.status.set(u"열림: %s" % path)
 
     # ------------------------------------------------ 라이브러리 끌어다 놓기
@@ -916,6 +917,7 @@ class MacroEditorApp(object):
         editing_this = self._is_self_reference(ref)
         if editing_this and self.macro.dirty and not self._confirm_discard():
             return
+        self._flush_last_selected()   # 끝나면 디스크에서 다시 읽는다
 
         try:
             os.makedirs(target_dir)
@@ -1043,6 +1045,7 @@ class MacroEditorApp(object):
         editing_this = self._is_self_reference(ref)
         if editing_this and self.macro.dirty and not self._confirm_discard():
             return
+        self._flush_last_selected()   # 끝나면 디스크에서 다시 읽는다
 
         try:
             os.rename(old_folder, new_folder)
@@ -1379,6 +1382,7 @@ class MacroEditorApp(object):
             for _r, _n, p in callers)
         if involved and self.macro.dirty and not self._confirm_discard():
             return
+        self._flush_last_selected()   # 끝나면 디스크에서 다시 읽는다
 
         try:
             os.rename(old_folder, new_folder)
@@ -1465,6 +1469,7 @@ class MacroEditorApp(object):
             return
         self.current_path = None
         self.apply_mode()
+        self.focus_opened_macro()
         self.status.set(u"열림: %s" % path)
 
     def open_macro_ref(self, ref):
@@ -1744,6 +1749,25 @@ class MacroEditorApp(object):
             self.refresh_library()
         if getattr(self, "submacro_list", None) is not None:
             self.refresh_submacros()
+
+    def focus_opened_macro(self):
+        """막 연 매크로의 그래프 화면 위치를 잡는다.
+
+        `apply_mode` 에 넣지 않는다 - 그쪽은 이름을 바꾼 뒤 다시 읽을 때나
+        패널을 다시 지을 때도 불리는데, 그때는 보던 자리가 그대로여야 한다.
+        """
+        if self.mode == "graph" and getattr(self, "canvas_view", None) is not None:
+            self.canvas_view.focus_opened()
+
+    def _flush_last_selected(self):
+        """떠나는 매크로의 마지막 선택 노드를 파일에 남긴다.
+
+        기록은 편의 기능이므로 실패해도 매크로를 떠나는 일을 막지 않는다.
+        """
+        try:
+            self.macro.store_last_selected()
+        except (OSError, ValueError) as exc:
+            self.log_line(u"마지막 선택 노드를 기록하지 못했습니다: %s" % exc, "err")
 
     def _sync_view_title(self):
         """가운데 패널 제목줄을 현재 모드에 맞춘다."""
@@ -2315,6 +2339,7 @@ class MacroEditorApp(object):
                     return
                 self.current_path = None
                 self.apply_mode()
+                self.focus_opened_macro()
                 self.status.set(u"열림: %s" % path)
             ttk.Button(row, text=u"열기", width=6, command=open_ref).pack(
                 side="left", padx=(4, 0))
@@ -3061,6 +3086,7 @@ class MacroEditorApp(object):
         # 묻지도 않고 그냥 버려진다. 묻기 전에 먼저 반영한다.
         self.flush_property_edits()
         if not self.macro.dirty:
+            self._flush_last_selected()
             return True
         answer = messagebox.askyesnocancel(
             u"저장하지 않은 변경", u"변경 내용을 저장할까요?")
@@ -3068,6 +3094,7 @@ class MacroEditorApp(object):
             return False
         if answer:
             return self.save_macro()
+        self._flush_last_selected()
         return True
 
     def new_macro(self):
@@ -3104,6 +3131,7 @@ class MacroEditorApp(object):
             self.log_line(u"경고: 편집기가 모르는 단계가 있습니다: %s" % ", ".join(unknown), "err")
         self.current_path = None
         self.apply_mode()
+        self.focus_opened_macro()
         self.status.set(u"열림: %s" % path)
         if not self.macro.is_graph:
             self.log_line(u"트리 형식 매크로입니다. [도구 > 그래프로 변환]으로 "
@@ -4061,6 +4089,8 @@ def _run():
         try:
             app.macro = model.Macro.load(sys.argv[1])
             app.apply_mode()
+            root.update()      # 창이 그려져야 가운데를 잴 수 있다
+            app.focus_opened_macro()
             app.status.set(u"열림: %s" % sys.argv[1])
         except Exception as exc:
             app.log_line(u"열기 실패: %s" % exc, "err")

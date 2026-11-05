@@ -3659,6 +3659,188 @@ finally:
     shutil.rmtree(_sc_tmp, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+section(u"매크로를 열 때 보는 위치")
+
+_lo_tmp = tempfile.mkdtemp(prefix="lastselected_")
+_lo_real = (mb.askyesnocancel,)
+
+
+def _lo_write(name, data):
+    path = os.path.join(_lo_tmp, name, "macro.json")
+    os.makedirs(os.path.dirname(path))
+    with open(path, "wb") as handle:
+        handle.write(json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
+    return path
+
+
+def _lo_read(path):
+    with open(path, "rb") as handle:
+        return json.loads(handle.read().decode("utf-8"))
+
+
+def _lo_graph(name, **extra):
+    data = graph_model.blank(name)
+    data["nodes"] = [
+        {"id": "n1", "type": "log", "message": "a",
+         "ui": {"x": 100, "y": 100}},
+        {"id": "n2", "type": "log", "message": "b",
+         "ui": {"x": 4000, "y": 3000}},
+        {"id": "n3", "type": "log", "message": "c",
+         "ui": {"x": -2000, "y": 900}},
+    ]
+    data["entry"] = "n1"
+    data.update(extra)
+    return data
+
+
+def _lo_centered(node_id):
+    """노드가 화면 한가운데에 있는가."""
+    cv = app.canvas_view
+    vw, vh = _view_size()
+    r = cv.node_rect(cv.graph.node(node_id))
+    return (abs((r[0] + r[2]) / 2.0 - vw / 2.0) < 1.0
+            and abs((r[1] + r[3]) / 2.0 - vh / 2.0) < 1.0)
+
+
+try:
+    # 앞선 테스트가 남긴 수정 때문에 저장 질문이 뜨지 않게 깨끗한 상태로 시작한다
+    mb.askyesnocancel = lambda *a, **k: False
+    app.macro.dirty = False
+
+    _lo_a = _lo_write("A", _lo_graph(u"가", lastSelected="n2"))
+    _lo_b = _lo_write("B", _lo_graph(u"나"))
+    _lo_c = _lo_write("C", _lo_graph(u"다", lastSelected="n99"))
+    _lo_empty = _lo_write("Empty", graph_model.blank(u"빈 매크로"))
+    _lo_nostart = _lo_graph(u"시작없음", entry=None)
+    _lo_nostart["entry"] = None
+    _lo_d = _lo_write("D", _lo_nostart)
+
+    # 규칙 2: 마지막 선택 노드로
+    app.open_macro_path(_lo_a)
+    _cv = app.canvas_view
+    check(u"마지막 선택 노드가 화면 가운데로 온다", _lo_centered("n2"))
+    check(u"다른 노드는 가운데에 있지 않다", not _lo_centered("n1"))
+    check(u"화면만 옮기고 선택은 하지 않는다",
+          _cv.selected_node is None and not _cv.selected_nodes
+          and app.current_step_obj is None)
+    check(u"열기만 해서는 수정됨이 되지 않는다", not app.macro.dirty)
+
+    # 규칙 3: 기록이 없으면 시작 노드로
+    _cv.zoom = 0.75
+    app.open_macro_path(_lo_b)
+    check(u"기록이 없으면 시작 노드로 간다",
+          _lo_centered("n1") and not _lo_centered("n2"))
+    check(u"열어도 배율은 그대로다", abs(_cv.zoom - 0.75) < 1e-6)
+    _cv.zoom = 1.0
+
+    # 기록은 있지만 그 노드가 지워진 경우도 규칙 3
+    app.open_macro_path(_lo_c)
+    check(u"지워진 노드를 가리키면 시작 노드로 간다",
+          _lo_centered("n1") and not _lo_centered("n2"))
+
+    # 규칙 1: 노드가 없으면 지금과 같다
+    _cv.origin = [123.0, 456.0]
+    app.open_macro_path(_lo_empty)
+    check(u"노드가 없으면 보는 위치가 그대로다", _cv.origin == [123.0, 456.0],
+          u"%r" % (_cv.origin,))
+
+    # 노드는 있는데 시작 노드도 기록도 없으면 움직일 곳이 없다
+    app.open_macro_path(_lo_d)
+    check(u"갈 곳이 없으면 보는 위치가 그대로다", _cv.origin == [123.0, 456.0],
+          u"%r" % (_cv.origin,))
+
+    # 선택 기록
+    app.open_macro_path(_lo_b)
+    _before = _lo_read(_lo_b)
+    _cv.set_selection(["n3"], active="n3")
+    check(u"선택만으로는 수정됨이 되지 않는다", not app.macro.dirty)
+    check(u"선택만으로는 파일이 바뀌지 않는다", _lo_read(_lo_b) == _before)
+    _cv.selected_node = None
+    check(u"선택을 비워도 기록은 남는다", app.graph.last_selected == "n3")
+    _cv.set_selection(["n1", "n2"], active="n2")
+    check(u"다중 선택은 활성 노드를 기록한다", app.graph.last_selected == "n2")
+    _cv.set_selection(["n3"], active="n3")
+
+    # 떠날 때 기록 - 수정이 없는 경우
+    app.open_macro_path(_lo_a)
+    check(u"떠나면 파일에 기록된다", _lo_read(_lo_b).get("lastSelected") == "n3")
+    _expected = dict(_before, lastSelected="n3")
+    check(u"그 필드 말고는 파일이 그대로다", _lo_read(_lo_b) == _expected)
+    check(u"임시 파일이 남지 않는다",
+          os.listdir(os.path.dirname(_lo_b)) == ["macro.json"],
+          u"%r" % (os.listdir(os.path.dirname(_lo_b)),))
+    app.open_macro_path(_lo_b)
+    check(u"다시 열면 그 노드로 간다",
+          _lo_centered("n3") and not _lo_centered("n1"))
+
+    # 떠날 때 기록 - 저장하지 않은 수정이 있는 경우
+    _cv.set_selection(["n2"], active="n2")
+    app.graph.node("n1")["message"] = u"저장 안 함"
+    _extra = _cv.add_node("log", 10, 10)["id"]
+    _cv.set_selection(["n2"], active="n2")
+    app.open_macro_path(_lo_a)
+    _stored = _lo_read(_lo_b)
+    check(u"버린 수정은 파일에 들어가지 않는다",
+          _stored["nodes"][0]["message"] == "a"
+          and _extra not in [n["id"] for n in _stored["nodes"]])
+    check(u"버린 수정이 있어도 선택은 기록된다", _stored["lastSelected"] == "n2")
+
+    # 파일에 없는 노드(저장 안 한 새 노드)는 기록하지 않는다
+    app.open_macro_path(_lo_b)
+    _extra = _cv.add_node("log", 10, 10)["id"]
+    check(u"새 노드도 기록 대상이다", app.graph.last_selected == _extra)
+    app.open_macro_path(_lo_a)
+    check(u"버린 새 노드는 기록되지 않는다",
+          _lo_read(_lo_b)["lastSelected"] == "n2")
+
+    # 저장하면 함께 들어간다
+    app.open_macro_path(_lo_b)
+    _cv.set_selection(["n3"], active="n3")
+    app.save_macro()
+    check(u"저장할 때 함께 기록된다", _lo_read(_lo_b)["lastSelected"] == "n3")
+
+    # 다시 읽기는 열기가 아니다 - 보던 자리를 유지한다
+    _cv.origin = [11.0, 22.0]
+    app.apply_mode()
+    check(u"다시 읽기는 보는 위치를 옮기지 않는다", _cv.origin == [11.0, 22.0])
+
+    # 기록이 실패해도 매크로는 떠날 수 있고 원본은 그대로다
+    _cv.set_selection(["n1"], active="n1")
+    _lo_replace = os.replace
+
+    def _lo_fail(*_a, **_k):
+        raise OSError("locked")
+
+    macro_editor.model.os.replace = _lo_fail
+    try:
+        app.open_macro_path(_lo_a)
+    finally:
+        macro_editor.model.os.replace = _lo_replace
+    check(u"기록에 실패해도 다음 매크로가 열린다", app.macro.path == _lo_a)
+    check(u"기록에 실패해도 원본은 그대로다",
+          _lo_read(_lo_b)["lastSelected"] == "n3")
+    check(u"기록 실패 시 임시 파일이 남지 않는다",
+          os.listdir(os.path.dirname(_lo_b)) == ["macro.json"])
+
+    # 실행 쪽에서 이 필드가 문제가 되지 않아야 한다
+    check(u"검사가 이 필드를 문제 삼지 않는다",
+          not graph_model.Graph(_lo_read(_lo_b)).validate()[0],
+          u"%r" % (graph_model.Graph(_lo_read(_lo_b)).validate()[0],))
+
+    # 트리 형식에는 노드 화면이 없다
+    _lo_tree = _lo_write("Tree", model.Macro.blank(u"트리"))
+    app.open_macro_path(_lo_tree)
+    check(u"트리 형식도 문제없이 열린다", app.mode == "tree")
+    app.open_macro_path(_lo_a)
+    check(u"트리에서 그래프로 돌아와도 위치를 잡는다", _lo_centered("n2"))
+finally:
+    mb.askyesnocancel = _lo_real[0]
+    app.macro = model.Macro(graph_model.blank(u"새 매크로"))
+    app.apply_mode()
+    shutil.rmtree(_lo_tmp, ignore_errors=True)
+
+
 print("")
 print("=" * 62)
 print("passed %d / %d" % (len(PASS), len(PASS) + len(FAIL)))

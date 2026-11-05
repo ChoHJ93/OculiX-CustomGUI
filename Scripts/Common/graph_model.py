@@ -41,6 +41,9 @@ except NameError:
 FORMAT_GRAPH = "graph"
 FORMAT_TREE = "tree"
 
+# 편집기가 마지막으로 선택한 노드 id. 실행에는 쓰지 않는다.
+LAST_SELECTED = "lastSelected"
+
 # ------------------------------------------------------------------ 매개변수
 #
 # 매크로는 입력 매개변수를 선언할 수 있고, 호출 노드가 값을 넘긴다.
@@ -495,6 +498,15 @@ class Graph(object):
     @entry.setter
     def entry(self, node_id):
         self.data["entry"] = node_id
+
+    @property
+    def last_selected(self):
+        """마지막으로 선택한 노드 id. 지워진 노드를 가리킬 수 있다."""
+        return self.data.get(LAST_SELECTED)
+
+    @last_selected.setter
+    def last_selected(self, node_id):
+        self.data[LAST_SELECTED] = node_id
 
     def node(self, node_id):
         for n in self.nodes:
