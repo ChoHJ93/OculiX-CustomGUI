@@ -1958,6 +1958,157 @@ check(u"하위 단독 실행에도 부모 감시가 먼저 걸린다",
       _code == 0 and marks(_lines) == ["H", "SW", "S1", "H", "SW", "S2"],
       u"exit=%s %r" % (_code, marks(_lines)))
 
+# --- 같은 감시를 여러 매크로가 걸어도 한 번만 돈다. 판정은 파일 위치로 한다.
+#     H 는 노드마다 한 번이다. 호출 노드와 호출된 매크로의 첫 노드는 각각
+#     확인하므로 그 자리에서는 H 가 연달아 나오는 것이 정상이다.
+_nodes, _links = mark_chain("h", ["X"])
+save_watch_macro("WatchOther", u"다른 감시", _nodes, _links, watch=W_ALWAYS)
+
+
+def call_chain(prefix, steps):
+    """MARK 노드와 호출 노드를 차례로 이은 (nodes, links). (step, True) 는 호출."""
+    nodes = []
+    for index, (value, is_call) in enumerate(steps):
+        node_id = "%s%d" % (prefix, index)
+        nodes.append({"id": node_id, "type": "call", "macro": value}
+                     if is_call else mark_node(node_id, value))
+    links = [{"from": nodes[i]["id"], "pin": "next", "to": nodes[i + 1]["id"]}
+             for i in range(len(nodes) - 1)]
+    return nodes, links
+
+
+# A -> B, 라이브러리 감시
+_nodes, _links = mark_chain("b", ["B1", "B2"])
+save_watch_macro("DupCallee", u"피호출", _nodes, _links,
+                 handlers=["WatchAlways"])
+_nodes, _links = call_chain("a", [("A1", False), ("DupCallee", True),
+                                  ("A2", False)])
+_p = save_watch_macro("DupCaller", u"호출자", _nodes, _links,
+                      handlers=["WatchAlways"],
+                      settings={"handlerInterval": 0})
+_code, _lines, _text = run_graph_path(_p)
+check(u"A -> B 가 같은 감시를 걸어도 노드마다 한 번만 돈다",
+      _code == 0 and marks(_lines) == ["H", "A1", "H", "H", "B1", "H", "B2",
+                                       "H", "A2"],
+      u"exit=%s %r" % (_code, marks(_lines)))
+check(u"A -> B 의 같은 감시는 다시 걸지 않는다",
+      _text.count(u"감시 시작") == 1 and u"감시 끝" not in _text,
+      u"시작 %d회" % _text.count(u"감시 시작"))
+
+# A -> B -> C, 셋 다 같은 감시
+_nodes, _links = mark_chain("c", ["C1"])
+save_watch_macro("DupLeaf", u"끝", _nodes, _links, handlers=["WatchAlways"])
+_nodes, _links = call_chain("b", [("B1", False), ("DupLeaf", True)])
+save_watch_macro("DupMiddle", u"중간", _nodes, _links,
+                 handlers=["WatchAlways"])
+_nodes, _links = call_chain("a", [("A1", False), ("DupMiddle", True)])
+_p = save_watch_macro("DupThree", u"3단계", _nodes, _links,
+                      handlers=["WatchAlways"],
+                      settings={"handlerInterval": 0})
+_code, _lines, _text = run_graph_path(_p)
+check(u"3단계 호출에서도 같은 감시는 노드마다 한 번만 돈다",
+      _code == 0 and marks(_lines) == ["H", "A1", "H", "H", "B1", "H", "H",
+                                       "C1"],
+      u"exit=%s %r" % (_code, marks(_lines)))
+
+# 최상위에는 없고 호출된 B 와 그 아래 C 가 같은 감시를 건다
+_nodes, _links = call_chain("a", [("A1", False), ("DupMiddle", True)])
+_p = save_watch_macro("DupInner", u"안쪽만", _nodes, _links,
+                      settings={"handlerInterval": 0})
+_code, _lines, _text = run_graph_path(_p)
+check(u"안쪽 매크로끼리 같은 감시를 걸어도 한 번만 돈다",
+      _code == 0 and marks(_lines) == ["A1", "H", "B1", "H", "H", "C1"],
+      u"exit=%s %r" % (_code, marks(_lines)))
+
+# 참조 표기가 달라도 같은 파일이면 같은 감시다
+_nodes, _links = mark_chain("b", ["B1"])
+save_watch_macro("DupCase", u"대소문자", _nodes, _links,
+                 handlers=["watchalways"])
+_nodes, _links = mark_chain("c", ["C1"])
+save_watch_macro("DupFile", u"파일 경로", _nodes, _links,
+                 handlers=["WatchAlways/macro.json"])
+_nodes, _links = mark_chain("d", ["D1"])
+save_watch_macro("DupAbs", u"절대 경로", _nodes, _links,
+                 handlers=[os.path.join(MACROS, "WatchAlways", "macro.json")])
+_nodes, _links = call_chain("a", [("DupCase", True), ("DupFile", True),
+                                  ("DupAbs", True)])
+_p = save_watch_macro("DupSpelling", u"표기 차이", _nodes, _links,
+                      handlers=["WatchAlways"],
+                      settings={"handlerInterval": 0})
+_code, _lines, _text = run_graph_path(_p)
+check(u"참조 표기가 달라도 같은 파일이면 한 번만 돈다",
+      _code == 0 and marks(_lines) == ["H", "H", "B1", "H", "H", "C1",
+                                       "H", "H", "D1"],
+      u"exit=%s %r" % (_code, marks(_lines)))
+
+# 목록 순서가 달라도 바깥에서 건 순서대로 한 번씩만 돈다
+_nodes, _links = mark_chain("b", ["B1"])
+save_watch_macro("DupOrderB", u"순서 반대", _nodes, _links,
+                 handlers=["WatchOther", "WatchAlways"])
+_nodes, _links = call_chain("a", [("A1", False), ("DupOrderB", True)])
+_p = save_watch_macro("DupOrderA", u"순서", _nodes, _links,
+                      handlers=["WatchAlways", "WatchOther"],
+                      settings={"handlerInterval": 0})
+_code, _lines, _text = run_graph_path(_p)
+check(u"감시 순서가 달라도 바깥 순서로 한 번씩만 돈다",
+      _code == 0 and marks(_lines) == ["H", "X", "A1", "H", "X", "H", "X",
+                                       "B1"],
+      u"exit=%s %r" % (_code, marks(_lines)))
+
+# 내용이 같아도 다른 파일이면 별개의 감시다
+_nodes, _links = mark_chain("h", ["COPY1"])
+save_watch_macro(os.path.join("DupFamA", "PopupWatch"), u"팝업 감시",
+                 _nodes, _links, watch=W_ALWAYS)
+_nodes, _links = mark_chain("h", ["COPY2"])
+save_watch_macro(os.path.join("DupFamB", "PopupWatch"), u"팝업 감시",
+                 _nodes, _links, watch=W_ALWAYS)
+_nodes, _links = mark_chain("b", ["B1"])
+save_watch_macro("DupFamB", u"가족 B", _nodes, _links,
+                 handlers=["./PopupWatch"])
+_nodes, _links = call_chain("a", [("A1", False), ("DupFamB", True)])
+_p = save_watch_macro("DupFamA", u"가족 A", _nodes, _links,
+                      handlers=["./PopupWatch"],
+                      settings={"handlerInterval": 0})
+_code, _lines, _text = run_graph_path(_p)
+check(u"이름이 같아도 다른 파일의 감시는 합치지 않는다",
+      _code == 0 and marks(_lines) == ["COPY1", "A1", "COPY1", "COPY1",
+                                       "COPY2", "B1"],
+      u"exit=%s %r" % (_code, marks(_lines)))
+
+# --- 감시의 호출 사슬은 메인과 별개다. 메인이 도는 중인 매크로를 불러도
+#     순환이 아니다. 간격을 길게 두어 메인이 그 매크로 안에 들어간 뒤
+#     (첫 노드 직전) 한 번만 걸리게 한다.
+_nodes, _links = call_chain("w", [("WatchShared", True), ("AFTER", False)])
+save_watch_macro("WatchCallsMain", u"메인을 부르는 감시", _nodes, _links,
+                 watch=W_ALWAYS)
+_nodes, _links = mark_chain("s", ["S1", "S2"])
+save_watch_macro("WatchShared", u"함께 쓰는 매크로", _nodes, _links,
+                 handlers=["WatchCallsMain"])
+_nodes, _links = call_chain("m", [("WatchShared", True)])
+_p = save_watch_macro("WatchSharedMain", u"메인", _nodes, _links,
+                      settings={"handlerInterval": 100})
+_code, _lines, _text = run_graph_path(_p)
+check(u"감시가 메인이 도는 중인 매크로를 호출할 수 있다",
+      _code == 0 and marks(_lines) == ["S1", "S2", "AFTER", "S1", "S2"],
+      u"exit=%s %r" % (_code, marks(_lines)))
+check(u"메인과 겹치는 호출을 순환으로 판정하지 않는다",
+      u"순환 호출" not in _text and u"처리 끝" in _text)
+
+# 감시 안에서 진짜 순환을 만들면 여전히 막는다 (메인은 이어 간다)
+_nodes, _links = call_chain("l", [("WatchCycleBody", True)])
+save_watch_macro("WatchCycleInner", u"되부르는 매크로", _nodes, _links)
+_nodes, _links = call_chain("w", [("WatchCycleInner", True)])
+save_watch_macro("WatchCycleBody", u"순환 감시", _nodes, _links, watch=W_ALWAYS)
+_nodes, _links = mark_chain("m", ["A", "B"])
+_p = save_watch_macro("WatchCycleMain", u"메인", _nodes, _links,
+                      handlers=["WatchCycleBody"],
+                      settings={"handlerInterval": 100})
+_code, _lines, _text = run_graph_path(_p)
+check(u"감시 안의 진짜 순환은 막고 메인은 이어 간다",
+      _code == 0 and marks(_lines) == ["A", "B"] and u"순환 호출" in _text
+      and u"처리가 실패" in _text,
+      u"exit=%s %r" % (_code, marks(_lines)))
+
 # --- 대기 중에도 감시가 돌고, 처리한 시간만큼 제한시간을 늘린다.
 #     감시 처리 2초, 대기 제한 3초, 간격 1초 -> 대기 중에 한 번 이상 걸려
 #     대기는 5초 넘게 걸린다. 빼 주지 않으면 3초 (+ 마지막 검색이 넘친 만큼).

@@ -1475,8 +1475,10 @@ class GraphEngine(Engine):
         self.executed = 0
         self.deadline = None
         # 호출된 매크로는 자기 예산을 새로 시작하면 안 된다. 상한이 무의미해진다.
-        # 루트 엔진 하나가 전체 실행의 예산과 호출 스택을 갖는다.
+        # 루트 엔진 하나가 전체 실행의 예산을 갖는다.
         self.root = root or self
+        # 호출 사슬은 흐름마다 하나다. 호출된 매크로는 호출한 쪽의 목록을 그대로
+        # 받고, 감시 처리는 메인과 별개인 자기 목록으로 시작한다.
         self.call_stack = call_stack if call_stack is not None else []
         # 하위 매크로를 단독으로 돌릴 때 부모의 감시 목록. make_engine 이 채운다.
         # (부모 매크로, 부모 폴더, 부모 macro.json 경로)
@@ -1842,7 +1844,7 @@ class GraphEngine(Engine):
         """다른 매크로를 함수처럼 호출한다.
 
         호출된 매크로는 자기 폴더를 기준으로 이미지를 찾고 자기 설정을 쓴다.
-        예산과 호출 스택만 루트와 공유한다.
+        예산은 루트와, 호출 사슬은 호출한 쪽과 공유한다.
         """
         self.stats["steps"] += 1
         ref = node.get("macro")
@@ -1870,7 +1872,7 @@ class GraphEngine(Engine):
             return self._call_failed(node)
 
         key = os.path.normcase(os.path.abspath(path))
-        stack = self.root.call_stack
+        stack = self.call_stack
         if key in stack:
             self.log(u"    순환 호출입니다. 호출 사슬: %s"
                      % u" -> ".join(os.path.basename(os.path.dirname(p))
