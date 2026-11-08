@@ -1231,10 +1231,15 @@ SPACE_WINDOW = "window"
 SPACE_SCREEN = "screen"
 SPACES = (SPACE_WINDOW, SPACE_SCREEN)
 
-# 이 값 이하로 다르면 같은 크기로 본다. 엔진은 물리값을 배율로 나눠서
-# 1364.0x1072.8 을 얻고 편집기는 1364x1072 를 얻는다. 기준 환경에서 이 차이로
-# 변환이 켜지면 안 된다.
-SAME_RECT_SLACK = 2
+# 반올림 차이. 엔진은 물리값을 배율로 나눠서 1364.0x1072.8 을 얻고 편집기는
+# 1364x1072 를 얻는다. 기준 환경에서 이 차이로 무엇이든 달라지면 안 된다.
+ROUNDING_SLACK = 2
+
+# 이 값 이하로 다르면 같은 창이다. 좌표를 보정하지 않고 축소본도 만들지 않는다.
+# 게임은 시작할 때의 DPI 로 제목 표시줄을 그려서, 배율을 바꾼 뒤 다시 띄우지
+# 않으면 안쪽이 (1.6,36) 1362x1066 이나 (0.8,24.8) 1364x1078 이 된다 (실측 최대 6).
+# 이 차이를 배율로 치면 204x35 가 203x35 가 되는데 줄일 이유가 없는 크기다.
+SAME_RECT_SLACK = 8
 
 # 변환할 때 검색 영역을 사방으로 넓히는 값(px). 창의 가로세로비가 살짝 달라지면
 # UI 가 최대 1.8px 어긋났다 (1364x1072 -> 1278x1000 실측).
@@ -1273,6 +1278,9 @@ class Transform(object):
     게임 창은 그렇고, 화면(실행기, 작업 표시줄)은 자리만 옮겨 간다.
 
     두 사각형이 사실상 같으면 `identity` 이고 값을 그대로 돌려준다.
+    다만 반올림보다 크게 다르면 검색 영역은 그만큼 넓힌다. 내용물이 실제로
+    밀려 있어서, 영역을 그대로 두면 빠듯한 노드의 대상이 영역 밖으로 나간다
+    (`Check_DD_VeryHard_Selected` 가 1362x1066 에서 4.1px 나간다).
     크기만 같고 위치가 다르면 `resized` 가 거짓이고 좌표만 옮긴다.
     """
 
@@ -1291,10 +1299,9 @@ class Transform(object):
         # 다른 창에서 실측한 UI 배율 0.7475 와 이 값 0.7476 이 일치했다.
         self.scale = math.sqrt(self.sx * self.sy)
         self.scales_content = scales_content
-        self.identity = True
-        for a, b in zip(self.reference, self.current):
-            if abs(a - b) > SAME_RECT_SLACK:
-                self.identity = False
+        self.drift = max(abs(a - b)
+                         for a, b in zip(self.reference, self.current))
+        self.identity = self.drift <= SAME_RECT_SLACK
 
     def _x(self, x):
         return self.cx + (float(x) - self.rx) * self.sx
@@ -1323,11 +1330,18 @@ class Transform(object):
         """
         x, y, w, h = [float(v) for v in region]
         if self.identity:
-            return [int(x), int(y), int(w), int(h)]
-        left = int(math.floor(self._x(x))) - REGION_PAD
-        top = int(math.floor(self._y(y))) - REGION_PAD
-        right = int(math.ceil(self._x(x + w))) + REGION_PAD
-        bottom = int(math.ceil(self._y(y + h))) + REGION_PAD
+            if self.drift <= ROUNDING_SLACK:
+                return [int(x), int(y), int(w), int(h)]
+            pad = int(math.ceil(self.drift))
+            left = int(x) - pad
+            top = int(y) - pad
+            right = int(x + w) + pad
+            bottom = int(y + h) + pad
+        else:
+            left = int(math.floor(self._x(x))) - REGION_PAD
+            top = int(math.floor(self._y(y))) - REGION_PAD
+            right = int(math.ceil(self._x(x + w))) + REGION_PAD
+            bottom = int(math.ceil(self._y(y + h))) + REGION_PAD
         if bounds:
             bx, by, bw, bh = [int(v) for v in bounds]
             left = max(left, bx)

@@ -221,6 +221,19 @@ code, text = run(path, ["--simulate-client=0.8,30.4,1364.0,1072.8",
                         "--simulate-screen=2048,1152"])
 check(u"물리값을 나눈 소수값도 기준으로 본다", u"기준과 같은 크기" in text)
 
+# 다른 배율에서 띄운 게임을 그대로 둔 경우 (실측 값)
+code, text = run(path, ["--simulate-client=1.6,36,1362.4,1066.4",
+                        "--simulate-screen=2048,1152"])
+check(u"작은 오차는 기준과 같은 크기로 본다",
+      u"최대 6px 달라 기준과 같은 크기로" in text, text[:500])
+check(u"작은 오차는 좌표를 바꾸지 않는다", u"좌표 지정 (88,73) ->" not in text
+      and u"좌표 지정 (88,73)" in text)
+check(u"작은 오차는 영역만 넓힌다",
+      u"범위 [934, 898, 429, 206] -> [928, 892, 441, 218])" in text, text[:900])
+check(u"작은 오차는 축소본을 만들지 않는다",
+      not os.path.exists(os.path.join(folder, graph_model.SCALED_FOLDER))
+      and u"축소본" not in text)
+
 code, text = run(path, ["--simulate-client=100,200,1364.0,1072.8",
                         "--simulate-screen=2048,1152"])
 check(u"창 위치만 다르면 그렇게 알린다", u"창 위치만 다릅니다" in text, text[:500])

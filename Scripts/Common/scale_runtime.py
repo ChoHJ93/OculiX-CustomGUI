@@ -176,7 +176,13 @@ class ScaleState(object):
             return
         self._last_state = state
         if view.identity:
-            self._say(u"해상도 대응: 창이 기준과 같은 크기입니다. 변환하지 않습니다")
+            if view.drift <= graph_model.ROUNDING_SLACK:
+                self._say(u"해상도 대응: 창이 기준과 같은 크기입니다. "
+                          u"변환하지 않습니다")
+            else:
+                self._say(u"해상도 대응: 창이 기준과 최대 %.0fpx 달라 기준과 같은 "
+                          u"크기로 봅니다 (현재 %s). 좌표와 이미지는 그대로 쓰고 "
+                          u"검색 영역만 넓힙니다" % (view.drift, view.size_key()))
             return
         self._say(u"해상도 대응: %s" % view.describe())
         if view.aspect_drift() > graph_model.ASPECT_WARN:

@@ -737,9 +737,12 @@ class Engine(object):
             view = self._view(step)
         except WindowMissing:
             return u"%s (창 없음)" % (spec,)
-        if view is None or view.identity:
+        if view is None:
             return spec
-        return u"%s -> %s" % (spec, view.region(spec, SCALE.screen_rect()))
+        actual = view.region(spec, SCALE.screen_rect())
+        if actual == [int(v) for v in spec]:
+            return spec
+        return u"%s -> %s" % (spec, actual)
 
     def _search_note(self, step):
         """어떤 조건으로 찾는지 한 줄로. 실패했을 때 무엇을 조일지 알려 준다."""

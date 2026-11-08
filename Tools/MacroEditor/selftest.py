@@ -506,8 +506,33 @@ check("물리값을 나눈 소수값도 기준으로 본다", _same.identity)
 check("기준이면 좌표를 건드리지 않는다", _same.point((88, 73)) == [88, 73]
       and _same.region([1, 2, 3, 4]) == [1, 2, 3, 4]
       and _same.offset((5, 6)) == [5, 6])
-check("3px 다르면 기준이 아니다",
-      not graph_model.Transform(_ref, [1, 30, 1367, 1072]).identity)
+check("9px 다르면 기준이 아니다",
+      not graph_model.Transform(_ref, [1, 30, 1373, 1072]).identity)
+
+# 배율을 바꾼 뒤 다시 띄우지 않은 게임. 제목 표시줄 두께만큼 다르다 (실측 값)
+for _name, _client in (("두꺼운 제목 표시줄", [1.6, 36.0, 1362.4, 1066.4]),
+                       ("얇은 제목 표시줄", [0.8, 24.8, 1364.0, 1078.4])):
+    _near = graph_model.Transform(_ref, _client)
+    check(_name + ": 기준으로 본다", _near.identity and not _near.resized)
+    check(_name + ": 좌표와 오프셋을 그대로 쓴다",
+          _near.point((186, 139)) == [186, 139]
+          and _near.offset((5, 6)) == [5, 6])
+    check(_name + ": 이미지 크기를 그대로 쓴다",
+          _near.image_size(204, 35) == (204, 35))
+    check(_name + ": 찍은 좌표도 그대로 저장한다",
+          _near.inverse_point((186, 139)) == [186, 139])
+_near = graph_model.Transform(_ref, [1.6, 36.0, 1362.4, 1066.4])
+check("오차만큼 검색 영역을 넓힌다",
+      _near.region([6, 49, 299, 136]) == [0, 43, 311, 148],
+      "%r" % (_near.region([6, 49, 299, 136]),))
+check("넓힌 영역도 화면 안으로 자른다",
+      _near.region([0, 1100, 100, 50], [0, 0, 2048, 1152])
+      == [0, 1094, 106, 58],
+      "%r" % (_near.region([0, 1100, 100, 50], [0, 0, 2048, 1152]),))
+# 1362x1066 에서 실제로 영역 밖으로 4.1px 밀리는 노드
+_area = _near.region([602, 72, 364, 132])
+check("밀린 대상이 넓힌 영역 안에 든다",
+      _area[1] + _area[3] >= 72 + 132 + 4.1, "%r" % (_area,))
 
 # 스냅으로 옮겨 가는 창. 크기는 같고 위치만 다르다 (실제 실행에서 나온 값)
 _moved = graph_model.Transform(_ref, [100, 200, 1364.0, 1072.8])
