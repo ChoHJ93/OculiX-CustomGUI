@@ -1958,6 +1958,27 @@ check(u"하위 단독 실행에도 부모 감시가 먼저 걸린다",
       _code == 0 and marks(_lines) == ["H", "SW", "S1", "H", "SW", "S2"],
       u"exit=%s %r" % (_code, marks(_lines)))
 
+# 하위의 특정 노드부터 돌려도 (편집기의 '이 노드부터 실행') 부모 감시가 걸린다
+_code, _lines, _text = run_graph_path(
+    os.path.join(MACROS, "WatchFam", "Work", "macro.json"), start_node="u1")
+check(u"하위를 노드부터 실행해도 부모 감시가 먼저 걸린다",
+      _code == 0 and marks(_lines) == ["H", "SW", "S2"]
+      and u"감시 시작 (감시 가족)" in _text,
+      u"exit=%s %r" % (_code, marks(_lines)))
+
+# 자기 감시가 없는 하위도 부모 감시를 받는다 - 직접 실행 / 노드부터 실행
+_nodes, _links = mark_chain("q", ["Q1", "Q2"])
+_plain = save_watch_macro(os.path.join("WatchFam", "Plain"), u"감시 없는 하위",
+                          _nodes, _links)
+_code, _lines, _text = run_graph_path(_plain)
+check(u"감시 없는 하위를 직접 실행해도 부모 감시가 걸린다",
+      _code == 0 and marks(_lines) == ["H", "Q1", "H", "Q2"],
+      u"exit=%s %r" % (_code, marks(_lines)))
+_code, _lines, _text = run_graph_path(_plain, start_node="q1")
+check(u"감시 없는 하위를 노드부터 실행해도 부모 감시가 걸린다",
+      _code == 0 and marks(_lines) == ["H", "Q2"],
+      u"exit=%s %r" % (_code, marks(_lines)))
+
 # --- 같은 감시를 여러 매크로가 걸어도 한 번만 돈다. 판정은 파일 위치로 한다.
 #     H 는 노드마다 한 번이다. 호출 노드와 호출된 매크로의 첫 노드는 각각
 #     확인하므로 그 자리에서는 H 가 연달아 나오는 것이 정상이다.
