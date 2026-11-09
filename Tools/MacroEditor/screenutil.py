@@ -236,7 +236,43 @@ def window_at(x, y):
     _user32.GetClassNameW(handle, kind, 256)
     title = ctypes.create_unicode_buffer(512)
     _user32.GetWindowTextW(handle, title, 512)
-    return {"class": kind.value, "title": title.value, "client": client}
+    return {"class": kind.value, "title": title.value, "client": client,
+            "process": window_process(handle)}
+
+
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND,
+                                             ctypes.POINTER(wintypes.DWORD))
+_kernel32 = ctypes.windll.kernel32
+_kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+_kernel32.OpenProcess.restype = wintypes.HANDLE
+_kernel32.QueryFullProcessImageNameW.argtypes = (
+    wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+    ctypes.POINTER(wintypes.DWORD))
+_kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+
+
+def window_process(handle):
+    """창을 만든 프로세스의 실행 파일 이름 (예: notepad.exe). 모르면 None.
+
+    엔진의 window_util.window_process 와 같은 값을 내야 한다 - 편집기에서
+    찍은 이름으로 엔진이 창을 찾는다.
+    """
+    pid = wintypes.DWORD()
+    _user32.GetWindowThreadProcessId(handle, ctypes.byref(pid))
+    process = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION,
+                                    False, pid.value)
+    if not process:
+        return None
+    try:
+        size = wintypes.DWORD(1024)
+        buf = ctypes.create_unicode_buffer(1024)
+        if not _kernel32.QueryFullProcessImageNameW(process, 0, buf,
+                                                    ctypes.byref(size)):
+            return None
+        return buf.value.replace("/", "\\").split("\\")[-1]
+    finally:
+        _kernel32.CloseHandle(process)
 
 
 def cursor_position():

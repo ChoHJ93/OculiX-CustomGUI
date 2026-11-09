@@ -2642,6 +2642,16 @@ class MacroEditorApp(object):
                        command=lambda: self._pick_point(var, commit, target)
                        ).pack(side="left", padx=(4, 0))
 
+        elif ftype == "screenpoint":
+            ttk.Button(row, text=u"찍기", width=6,
+                       command=lambda: self._pick_screen_point(var, commit)
+                       ).pack(side="left", padx=(4, 0))
+
+        elif ftype == "window":
+            ttk.Button(row, text=u"찍기", width=6,
+                       command=lambda: self._pick_window(target)
+                       ).pack(side="left", padx=(4, 0))
+
         elif ftype == "points":
             # 찍을 때마다 뒤에 이어 붙인다. 경유지는 순서가 의미를 갖는다.
             def add_point():
@@ -2722,9 +2732,10 @@ class MacroEditorApp(object):
             return int(text)
         if ftype == "float":
             return float(text)
-        if ftype in ("point", "rgb", "region"):
+        if ftype in ("point", "screenpoint", "rgb", "region"):
             parts = [p.strip() for p in text.replace(",", " ").split()]
-            expected = {"point": 2, "rgb": 3, "region": 4}[ftype]
+            expected = {"point": 2, "screenpoint": 2, "rgb": 3,
+                        "region": 4}[ftype]
             if len(parts) != expected:
                 raise ValueError(u"숫자 %d개가 필요합니다" % expected)
             return [int(float(p)) for p in parts]
@@ -2794,6 +2805,43 @@ class MacroEditorApp(object):
             var.set("%d, %d" % tuple(stored))
             commit()
             self._warn_if_offscreen(point)
+
+    def _pick_screen_point(self, var, commit):
+        """화면 좌표를 찍은 그대로 저장한다 (창 이동 좌표).
+
+        해상도 대응 변환을 하지 않는다. 창을 어느 모니터 어디에 둘지는 게임 창
+        크기와 무관하다. 보조 모니터도 정당한 대상이라 화면 밖 경고도 없다.
+        """
+        point = self.run_with_window_hidden(
+            lambda: pickers.pick_point(self.root))
+        if point:
+            var.set("%d, %d" % tuple(point))
+            commit()
+
+    def _pick_window(self, target):
+        """창을 눌러서 그 창의 제목/클래스/프로세스로 대상 조건을 채운다."""
+        point = self.run_with_window_hidden(
+            lambda: pickers.pick_point(self.root))
+        if not point:
+            return
+        found = screenutil.window_at(*point)
+        if found is None:
+            self.status.set(u"그 자리에서 창을 찾지 못했습니다")
+            return
+        for key, value in (("title", found["title"]),
+                           ("windowClass", found["class"]),
+                           ("process", found.get("process"))):
+            if value:
+                target[key] = value
+            else:
+                target.pop(key, None)
+        self.log_line(u"창 지정: \"%s\" [%s, %s]. 제목이 바뀌는 앱이면 제목을 "
+                      u"비우거나 줄이세요"
+                      % (found["title"], found["class"],
+                         found.get("process") or u"프로세스 모름"), "info")
+        self.mark_dirty()
+        self.refresh_tree_labels()
+        self.build_properties()
 
     def _pick_region(self, var, commit, target=None):
         region = self.run_with_window_hidden(

@@ -947,6 +947,110 @@ class Engine(object):
         self.log(u"    정상 종료 (코드 0)")
         return True
 
+    # ------------------------------------------------------------- 창
+
+    def _window(self, step):
+        u"""노드가 가리키는 창을 찾는다. 제한시간까지 기다린다. 못 찾으면 None.
+
+        여러 창이 맞으면 화면 맨 앞의 것을 쓰고 그 사실을 남긴다.
+        """
+        import window_util
+        spec = window_util.spec_of(step)
+        if spec is None:
+            self.log(u"    창 조건이 없습니다 (제목, 클래스, 프로세스 중 하나)")
+            return None
+        timeout = self._timeout(step)
+
+        def attempt(seconds):
+            deadline = time.time() + seconds
+            while True:
+                found = window_util.find_windows(spec)
+                if found:
+                    return found
+                left = deadline - time.time()
+                if left <= 0:
+                    return None
+                time.sleep(min(window_util.FIND_POLL, left))
+
+        found = self._watched(timeout, attempt)
+        if not found:
+            self.log(u"    창을 찾지 못했습니다: %s (%.0fs)"
+                     % (window_util.describe_spec(spec), timeout))
+            return None
+        handle = found[0]
+        if len(found) > 1:
+            self.log(u"    조건에 맞는 창이 %d개라 맨 앞의 창을 씁니다"
+                     % len(found))
+        self.log(u"    창: %s" % window_util.describe(handle))
+        return handle
+
+    def _focus_window(self, step):
+        import window_util
+        handle = self._window(step)
+        if handle is None:
+            return False
+        if window_util.is_foreground(handle) \
+                and window_util.window_state(handle) != window_util.MINIMIZED:
+            self.log(u"    이미 포커스를 가진 창입니다")
+            return True
+        if not window_util.focus(handle, self.log):
+            self.log(u"    포커스를 가져오지 못했습니다. Windows 가 다른 창의 "
+                     u"포커스를 지키고 있습니다")
+            return False
+        self.log(u"    포커스를 옮겼습니다")
+        return True
+
+    def _move_window(self, step):
+        u"""창 테두리의 왼쪽 위를 지정한 화면 좌표로 옮긴다.
+
+        옮기면 안 되는 상태(전체 화면, 최대화, 최소화)나 어느 모니터에도 없는
+        좌표는 로그만 남기고 넘어간다. 실패로 보지 않는다.
+        """
+        import window_util
+        point = step.get("point")
+        if not (isinstance(point, (list, tuple)) and len(point) == 2):
+            self.log(u"    옮길 좌표가 없습니다")
+            return False
+        x, y = int(point[0]), int(point[1])
+        handle = self._window(step)
+        if handle is None:
+            return False
+
+        state = window_util.window_state(handle)
+        if state != window_util.NORMAL:
+            self.log(u"    %s 상태라 옮기지 않습니다"
+                     % window_util.STATE_LABELS[state])
+            return True
+        monitor = window_util.monitor_at(x, y)
+        if monitor is None:
+            self.log(u"    (%d, %d) 는 어느 모니터에도 없어 옮기지 않습니다"
+                     % (x, y))
+            return True
+
+        before = window_util.frame_rect(handle)
+        if before is not None and before[0] == x and before[1] == y:
+            self.log(u"    이미 (%d, %d) 에 있습니다" % (x, y))
+            return True
+        width = before[2] - before[0] if before else 0
+        height = before[3] - before[1] if before else 0
+        if before and (x + width > monitor[2] or y + height > monitor[3]):
+            self.log(u"    주의: %dx%d 창이 그 모니터 (%d,%d)-(%d,%d) 밖으로 "
+                     u"삐져나갑니다" % ((width, height) + tuple(monitor)))
+
+        after = window_util.move_frame(handle, x, y)
+        if after is None:
+            self.log(u"    옮긴 뒤 창 위치를 읽지 못했습니다")
+            return False
+        self.log(u"    옮김: (%d, %d) -> (%d, %d)"
+                 % (before[0] if before else -1, before[1] if before else -1,
+                    after[0], after[1]))
+        slack = window_util.MOVE_SLACK
+        if abs(after[0] - x) > slack or abs(after[1] - y) > slack:
+            self.log(u"    창이 요청한 자리 (%d, %d) 에 가지 않았습니다. "
+                     u"앱이 위치를 되돌렸을 수 있습니다" % (x, y))
+            return False
+        return True
+
     @staticmethod
     def _read_stream(process):
         from java.io import BufferedReader, InputStreamReader
@@ -1197,6 +1301,12 @@ class Engine(object):
 
         if stype == "run":
             return self._run_program(step)
+
+        if stype == "focusWindow":
+            return self._focus_window(step)
+
+        if stype == "moveWindow":
+            return self._move_window(step)
 
         if stype == "waitImage":
             match = self._find(step)

@@ -52,6 +52,25 @@ _IMAGE_SEARCH_FIELDS = [
     SPACE_FIELD,
 ]
 
+# 창 노드가 대상 창을 찾는 조건. 준 것을 모두 만족하는 창을 찾는다.
+_WINDOW_FIELDS = [
+    {"name": "title", "type": "window", "label": u"창 제목",
+     "help": u"[찍기] 로 창을 누르면 제목·클래스·프로세스가 함께 채워진다. "
+             u"제목이 바뀌는 앱(브라우저, 문서 이름이 붙는 편집기)은 제목을 "
+             u"비우거나 바뀌지 않는 부분만 남긴다. 대소문자는 무시한다"},
+    {"name": "titleMatch", "type": "choice", "label": u"제목 비교",
+     "default": "contains",
+     "options": [("contains", u"포함하면"), ("exact", u"정확히 같으면")]},
+    {"name": "windowClass", "type": "str", "label": u"창 클래스",
+     "help": u"Win32 창 클래스 이름. 정확히 같아야 한다"},
+    {"name": "process", "type": "str", "label": u"프로세스",
+     "help": u"실행 파일 이름. 예: notepad.exe (.exe 는 생략 가능). "
+             u"보호되는 프로세스는 이름을 읽지 못해 이 조건으로 못 찾을 수 있다"},
+    {"name": "timeout", "type": "float", "label": u"제한시간(초)",
+     "help": u"창이 뜰 때까지 기다리는 시간. 비우면 매크로 기본값. "
+             u"여러 창이 맞으면 화면 맨 앞의 창을 쓴다"},
+]
+
 _CLICK_FIELDS = [
     {"name": "image", "type": "image", "label": u"이미지",
      "help": u"이미지를 찾아서 그 위치를 클릭. 좌표 대신 이쪽을 권장"},
@@ -122,6 +141,24 @@ STEP_TYPES = OrderedDict([
             {"name": "timeout", "type": "float", "label": u"대기 제한(초)",
              "help": u"끝날 때까지 대기할 때만 쓰인다. 비우면 30초"},
             {"name": "workingDir", "type": "str", "label": u"작업 폴더"},
+        ],
+    }),
+
+    # --- 창 ---
+    ("focusWindow", {
+        "label": u"창 포커스",
+        "group": u"창",
+        "fields": _WINDOW_FIELDS,
+    }),
+    ("moveWindow", {
+        "label": u"창 이동",
+        "group": u"창",
+        "fields": _WINDOW_FIELDS + [
+            {"name": "point", "type": "screenpoint", "label": u"옮길 좌표",
+             "help": u"창 테두리의 왼쪽 위가 갈 화면 좌표. 크기는 그대로다. "
+                     u"전체 화면·최대화·최소화 상태이거나 좌표가 어느 모니터에도 "
+                     u"없으면 로그만 남기고 옮기지 않는다 (실패가 아니다). "
+                     u"해상도 대응을 써도 이 좌표는 바꾸지 않는다"},
         ],
     }),
 
@@ -569,6 +606,10 @@ def summarize(step):
                                           shown, len(values))
     elif stype == "call":
         detail = step.get("macro") or u"(매크로 미지정)"
+    elif stype in ("focusWindow", "moveWindow"):
+        detail = describe_window(step)
+        if stype == "moveWindow" and step.get("point"):
+            detail += u" -> (%s, %s)" % tuple(step["point"])
     elif stype == "run":
         detail = step.get("command") or u"(명령 미지정)"
         if step.get("args"):
@@ -578,6 +619,14 @@ def summarize(step):
     if detail:
         return u"%s  —  %s" % (base, detail)
     return base
+
+
+def describe_window(step):
+    """창 노드가 찾는 창을 한 줄로."""
+    for key in ("title", "process", "windowClass"):
+        if step.get(key):
+            return step[key]
+    return u"(창 미지정)"
 
 
 def describe_condition(cond):

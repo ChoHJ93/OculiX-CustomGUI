@@ -53,7 +53,7 @@ engine_steps = {
     "log", "wait", "waitImage", "waitVanish", "click", "doubleClick",
     "rightClick", "hover", "mouseDown", "mouseUp", "drag", "wheel",
     "type", "key", "waitColor", "waitText", "if", "repeat", "break",
-    "call", "run",
+    "call", "run", "focusWindow", "moveWindow",
 }
 declared = set(schema.STEP_TYPES.keys())
 check("엔진 지원 단계가 모두 등록됨", engine_steps <= declared,

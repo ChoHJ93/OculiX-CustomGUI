@@ -1632,7 +1632,30 @@ def validate_node_params(nodes, cautions=None):
             problems.append(u"%s: 호출할 매크로를 지정해야 합니다" % where)
         if ntype == "run" and not node.get("command"):
             problems.append(u"%s: 실행할 명령을 지정해야 합니다" % where)
+        if ntype in WINDOW_TYPES:
+            if not window_spec_given(node):
+                problems.append(u"%s: 창 제목, 창 클래스, 프로세스 중 하나는 "
+                                u"지정해야 합니다" % where)
+            if node.get("titleMatch") not in (None, "") + TITLE_MATCHES:
+                problems.append(u"%s: 제목 비교(titleMatch)는 %s 중 하나여야 "
+                                u"합니다 (지금 %r)"
+                                % (where, u"/".join(TITLE_MATCHES),
+                                   node.get("titleMatch")))
+        if ntype == "moveWindow":
+            point = node.get("point")
+            if not (isinstance(point, (list, tuple)) and len(point) == 2):
+                problems.append(u"%s: 옮길 좌표 [x, y] 가 필요합니다" % where)
     return problems
+
+
+# 창을 대상으로 하는 노드. 창은 제목/클래스/프로세스로 찾는다.
+WINDOW_TYPES = ("focusWindow", "moveWindow")
+WINDOW_KEYS = ("title", "windowClass", "process")
+TITLE_MATCHES = ("contains", "exact")
+
+
+def window_spec_given(node):
+    return any(u"%s" % (node.get(key) or u"") != u"" for key in WINDOW_KEYS)
 
 
 # --------------------------------------------------------------- 생성 / 변환
