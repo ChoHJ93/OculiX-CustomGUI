@@ -742,3 +742,52 @@ Mabinogi 종료 후 동작: Unknown (아직 시도하지 못함)
 시작 메뉴 아이콘 클릭 : Unknown (OculiX 로 눌리지 않았다. 포커스가 옮겨가며
                        메뉴가 닫히는 것으로 의심되나 확인하지 못했다)
 ```
+
+## 설치 이력과 주의사항 (2026-11-09 CLAUDE.md 에서 옮김)
+
+설치 직후 `CLAUDE.md` 에 적어 두었던 내용이다. 매 세션 읽을 필요가 없어서 옮겼다.
+버전·해시·경로는 위의 "Java", "OculiX" 절에 있다.
+
+### 공식 출처 조회 결과 (2026-08-15)
+
+* 구 저장소 `oculix-org/SikuliX1` 이 archive 되면서 개발·릴리스·문서·커뮤니티는 모두
+  OculiX 로 옮겼다. 원저자 RaiMan 이 개발을 중단한 뒤 Julien Mer 가 동의를 받아 인수했다.
+* 기존 SikuliX Jython 스크립트와 `.sikuli` bundle 은 drop-in 호환이라고 명시되어 있다.
+* Windows 배포 파일: `oculixide-4.0.0-windows.jar` (약 130MB, IDE),
+  `oculixapi-4.0.0-windows.jar` (약 69MB, API only). GitHub Release asset 의 `digest`
+  필드로 SHA-256 을 확인할 수 있다.
+* 공식 설치 문서 본문의 예시 명령은 3.0.3 기준으로 적혀 있었다. 버전 번호는 Releases 페이지를 기준으로 한다.
+* 요구 사항: Windows 10 이상, x86-64, RAM 최소 1GB (권장 4GB).
+* Windows 관련 공식 언급: 다중 모니터는 `Screen(n)` 으로 구분한다. 캡처 시점과 재생 시점의
+  scaling 비율이 다르면 매칭이 실패할 수 있고, 이 경우 `Pattern("foo.png").similar(...)` 를
+  낮추라고 안내한다. 이 프로젝트는 스케일링 고정을 먼저 적용하고 threshold 하향은 그 다음 수단으로 둔다.
+* 공식 출처: <https://oculix.org/>, <https://docs.oculix.org/>,
+  <https://github.com/oculix-org/Oculix>, <https://github.com/oculix-org/Oculix/releases>
+
+### 초기 미해결 사항의 처리 (2026-08-15)
+
+1. 처음에는 `oculixapi` 만 있고 IDE 가 없었다 → `oculixide-4.0.0-windows.jar` 를 추가로 받아 digest 대조.
+2. `oculixapi` JAR 에는 `Main-Class` 가 없다 → 스크립트 실행에는 IDE JAR 을 쓴다 (Known Issues 4).
+3. PC 에 Java 가 없었다 → Temurin JDK 21 을 zip 으로 설치 (위 "Java" 절).
+
+### 환경 변수 수정 시 주의
+
+* User `Path` 는 레지스트리 타입이 `REG_EXPAND_SZ`(ExpandString)이고 `%USERPROFILE%` 참조를 포함한다.
+  `[Environment]::SetEnvironmentVariable(...,'User')` 를 쓰면 `REG_SZ` 로 바뀌어 기존
+  `%USERPROFILE%` 항목이 깨진다. 반드시 다음 방식으로 수정한다.
+
+  ```powershell
+  Set-ItemProperty -Path 'HKCU:\Environment' -Name 'Path' -Type ExpandString -Value $new
+  ```
+
+* Path 항목은 `%JAVA_HOME%\bin` 이 아니라 절대 경로를 쓴다. 변수 전개 동작을 이 환경에서
+  확실히 검증할 수단이 없었기 때문이다. JDK 버전을 올릴 때는 `JAVA_HOME` 과 `Path` **두 값을 모두** 고친다.
+* Machine 스코프는 건드리지 않았다 (관리자 권한 없음). User 스코프만으로 이 사용자의 모든 프로세스에 적용된다.
+* 변경 전 원본 환경 변수 백업: `Docs\env-backup-2026-08-15.txt`
+* 기존 `%USERPROFILE%\.dotnet\tools` 항목은 실제 디렉터리가 없다. 이 작업 이전부터의 상태이며 건드리지 않았다.
+
+### 압축 해제본
+
+`D:\Apps\oculixapi-4.0.0-windows\` 는 설치 결과물이 아니라 JAR 을 그대로 푼 내용이다
+(`org\`, `com\`, `META-INF\` 등). 실행에는 원본 `.jar` 을 쓰고, 해제본은 내부 구조 확인용으로만
+참조한다. 삭제 여부는 사용자가 판단한다.
