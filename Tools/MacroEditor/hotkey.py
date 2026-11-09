@@ -19,6 +19,7 @@
 """
 
 import ctypes
+import gc
 import threading
 from ctypes import wintypes
 
@@ -49,6 +50,13 @@ class GlobalHotkey(object):
         if self.active:
             return True
         self.error = None
+        # 쓰레기를 여기(메인 스레드)서 미리 치운다. 새 스레드에서 GC 가 돌면
+        # 편집기가 버린 tkinter 변수의 __del__ 이 그 스레드에서 불리고, 그
+        # 호출은 메인 루프를 기다린다. 메인은 아래에서 _ready 를 기다리는
+        # 중이라 둘이 서로를 기다리다 등록이 "응답이 없습니다" 로 끝난다
+        # (guitest 에서 재현, 2026-11-09).
+        gc.collect()
+        self._thread_id = None
         self._ready = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -62,10 +70,15 @@ class GlobalHotkey(object):
         thread = self._thread
         if thread is None:
             return
+        # 시작이 응답 없이 끝났어도 스레드는 늦게 등록을 마칠 수 있다.
+        # 스레드 id 를 모르면 WM_QUIT 를 보낼 곳이 없어 키가 남는다.
+        if self._thread_id is None and self._ready is not None:
+            self._ready.wait(2.0)
         try:
-            self._user32().PostThreadMessageW(
-                self._thread_id, _WM_QUIT, 0, 0)
-        except (AttributeError, OSError):
+            if self._thread_id is not None:
+                self._user32().PostThreadMessageW(
+                    self._thread_id, _WM_QUIT, 0, 0)
+        except (AttributeError, OSError, ctypes.ArgumentError):
             pass
         thread.join(2.0)
         self._thread = None
